@@ -54,6 +54,9 @@ pub struct Session {
 
     /// Optional signal receiver for migration events
     signal_rx: Option<broadcast::Receiver<SessionMigration>>,
+
+    /// True when the session was created via `accept` and acts as the server
+    is_server: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +80,7 @@ impl Session {
         first_requestid: u64,
         mlog: Option<mlog::MlogWriter>,
         signal_rx: Option<broadcast::Receiver<SessionMigration>>,
+        is_server: bool,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let next_requestid = Arc::new(atomic::AtomicU64::new(first_requestid));
         let outgoing = Queue::default().split();
@@ -105,6 +109,7 @@ impl Session {
             outgoing: outgoing.1,
             mlog: mlog_shared,
             signal_rx,
+            is_server,
         };
 
         (session, publisher, subscriber)
@@ -148,7 +153,7 @@ impl Session {
         // TODO: emit server_setup_parsed event
 
         // We are the client, so the first request id is 0
-        let session = Session::new(session, sender, recver, 0, mlog, signal_rx);
+        let session = Session::new(session, sender, recver, 0, mlog, signal_rx, false);
         Ok((session.0, session.1.unwrap(), session.2.unwrap()))
     }
 
@@ -202,7 +207,7 @@ impl Session {
             sender.encode(&server).await?;
 
             // We are the server, so the first request id is 1
-            Ok(Session::new(session, sender, recver, 1, mlog, signal_rx))
+            Ok(Session::new(session, sender, recver, 1, mlog, signal_rx, true))
         } else {
             Err(SessionError::Version(client.versions, server_versions))
         }
@@ -236,7 +241,7 @@ impl Session {
         }
 
         tokio::select! {
-            res = Self::run_recv(self.recver, self.publisher, self.subscriber.clone(), self.mlog.clone()) => res,
+            res = Self::run_recv(self.recver, self.publisher, self.subscriber.clone(), self.mlog.clone(), self.is_server) => res,
             res = Self::run_send(self.sender, self.outgoing, self.subscriber.clone(), self.mlog.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber) => res,
@@ -316,7 +321,10 @@ impl Session {
         mut publisher: Option<Publisher>,
         mut subscriber: Option<Subscriber>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        is_server: bool,
     ) -> Result<(), SessionError> {
+        let mut goaway_received = false;
+
         loop {
             let msg: message::Message = recver.decode().await?;
             log::debug!("received message: {:?}", msg);
@@ -386,6 +394,16 @@ impl Session {
 
             let msg = match msg {
                 Message::GoAway(goaway) => {
+                    if goaway_received {
+                        return Err(SessionError::ProtocolViolation("multiple GOAWAY messages"));
+                    }
+                    if is_server && !goaway.uri.0.is_empty() {
+                        return Err(SessionError::ProtocolViolation(
+                            "server received GOAWAY with URI",
+                        ));
+                    }
+
+                    goaway_received = true;
                     info!("Received GOAWAY: {:?}", goaway);
                     subscriber
                         .as_mut()

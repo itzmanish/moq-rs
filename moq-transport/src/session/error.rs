@@ -26,6 +26,9 @@ pub enum SessionError {
     #[error("role violation")]
     RoleViolation,
 
+    #[error("protocol violation: {0}")]
+    ProtocolViolation(&'static str),
+
     /// Some VarInt was too large and we were too lazy to handle it
     #[error("varint bounds exceeded")]
     BoundsExceeded(#[from] coding::BoundsExceeded),
@@ -52,6 +55,7 @@ impl SessionError {
         match self {
             // PROTOCOL_VIOLATION (0x3) - The role negotiated in the handshake was violated
             Self::RoleViolation => 0x3,
+            Self::ProtocolViolation(_) => 0x3,
             // INTERNAL_ERROR (0x1) - Generic internal errors
             Self::Session(_) => 0x1,
             Self::Read(_) => 0x1,
