@@ -2,7 +2,10 @@ use std::{
     collections::{hash_map, HashMap},
     io,
     sync::{atomic, Arc, Mutex},
+    time::Duration,
 };
+
+use tokio::sync::Notify;
 
 use crate::{
     coding::{Decode, TrackNamespace},
@@ -15,6 +18,9 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{Announced, AnnouncedRecv, Reader, Session, SessionError, Subscribe, SubscribeRecv};
+
+// Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
+const DEFAULT_ALIAS_WAIT_TIME_MS: u64 = 1000;
 
 // TODO remove Clone.
 #[derive(Clone)]
@@ -30,6 +36,9 @@ pub struct Subscriber {
 
     /// Map of track alias to subscription id for quick lookup when receiving streams/datagrams.
     subscribe_alias_map: Arc<Mutex<HashMap<u64, u64>>>,
+
+    /// Notify when subscribe alias map is updated
+    subscribe_alias_notify: Arc<Notify>,
 
     /// The queue we will write any outbound control messages we want to send, the session run_send task
     /// will process the queue and send the message on the control stream.
@@ -60,6 +69,7 @@ impl Subscriber {
             outgoing,
             next_requestid,
             mlog,
+            subscribe_alias_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -204,6 +214,9 @@ impl Subscriber {
                 .unwrap()
                 .insert(msg.track_alias, msg.id);
 
+            // Notify waiting tasks that the alias map has been updated
+            self.subscribe_alias_notify.notify_waiters();
+
             // Notify the subscribe of the successful subscription
             subscribe.ok(msg.track_alias)?;
         }
@@ -258,13 +271,47 @@ impl Subscriber {
         self.announced.lock().unwrap().remove(namespace);
     }
 
-    /// Get a subscribe id by track alias.
-    fn get_subscribe_id_by_alias(&mut self, track_alias: u64) -> Option<u64> {
-        self.subscribe_alias_map
-            .lock()
-            .unwrap()
-            .get(&track_alias)
-            .cloned()
+    /// Get a subscribe id by track alias, waiting up to the specified timeout if not present.
+    /// If timeout_ms is None, only check if already present and return None if not.
+    async fn get_subscribe_id_by_alias(
+        &self,
+        track_alias: u64,
+        timeout_ms: Option<u64>,
+    ) -> Option<u64> {
+        // If no timeout specified, don't wait
+        let timeout_ms = match timeout_ms {
+            Some(ms) => ms,
+            None => {
+                // Just check once
+                return self
+                    .subscribe_alias_map
+                    .lock()
+                    .unwrap()
+                    .get(&track_alias)
+                    .cloned();
+            }
+        };
+
+        // Wait for it to appear, checking after each notification
+        let timeout_duration = Duration::from_millis(timeout_ms);
+        tokio::time::timeout(timeout_duration, async {
+            loop {
+                // Check first
+                if let Some(id) = self
+                    .subscribe_alias_map
+                    .lock()
+                    .unwrap()
+                    .get(&track_alias)
+                    .cloned()
+                {
+                    return id;
+                }
+                // Then wait for notification
+                self.subscribe_alias_notify.notified().await;
+            }
+        })
+        .await
+        .ok()
     }
 
     /// Handle reception of a new stream from the QUIC session.
@@ -282,6 +329,11 @@ impl Subscriber {
             stream_header.header_type
         );
 
+        // No fetch support yet
+        if !stream_header.header_type.is_subgroup() {
+            return Err(SessionError::unimplemented("non-SUBGROUP stream types"));
+        }
+
         // Log subgroup header parsed/received
         if let Some(ref subgroup_header) = stream_header.subgroup_header {
             if let Some(ref mlog) = self.mlog {
@@ -294,7 +346,6 @@ impl Subscriber {
             }
         }
 
-        // No fetch support yet, so panic if fetch_header for now (via unwrap below)
         let track_alias = stream_header.subgroup_header.as_ref().unwrap().track_alias;
         log::trace!(
             "[SUBSCRIBER] recv_stream: stream for subscription track_alias={}",
@@ -309,9 +360,9 @@ impl Subscriber {
                 track_alias,
                 err
             );
-            // The writer is closed, so we should teriminate.
+            // The writer is closed, so we should terminate.
             // TODO it would be nice to do this immediately when the Writer is closed.
-            if let Some(subscribe_id) = self.get_subscribe_id_by_alias(track_alias) {
+            if let Some(subscribe_id) = self.get_subscribe_id_by_alias(track_alias, None).await {
                 if let Some(subscribe) = self.remove_subscribe(subscribe_id) {
                     subscribe.error(err.clone())?;
                 }
@@ -342,7 +393,10 @@ impl Subscriber {
 
         let writer = {
             // Look up the subscribe id for this track alias
-            if let Some(subscribe_id) = self.get_subscribe_id_by_alias(track_alias) {
+            if let Some(subscribe_id) = self
+                .get_subscribe_id_by_alias(track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
+                .await
+            {
                 // Look up the subscribe by id
                 let mut subscribes = self.subscribes.lock().unwrap();
                 let subscribe = subscribes.get_mut(&subscribe_id).ok_or_else(|| {
@@ -577,7 +631,7 @@ impl Subscriber {
     }
 
     /// Handle reception of a datagram from the QUIC session.
-    pub fn recv_datagram(&mut self, datagram: bytes::Bytes) -> Result<(), SessionError> {
+    pub async fn recv_datagram(&mut self, datagram: bytes::Bytes) -> Result<(), SessionError> {
         let mut cursor = io::Cursor::new(datagram);
         let datagram = data::Datagram::decode(&mut cursor)?;
 
@@ -627,7 +681,10 @@ impl Subscriber {
         }
 
         // Look up the subscribe id for this track alias
-        if let Some(subscribe_id) = self.get_subscribe_id_by_alias(datagram.track_alias) {
+        if let Some(subscribe_id) = self
+            .get_subscribe_id_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
+            .await
+        {
             // Look up the subscribe by id
             if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&subscribe_id) {
                 log::trace!(

@@ -385,7 +385,8 @@ impl Session {
             subscriber
                 .as_mut()
                 .ok_or(SessionError::RoleViolation)?
-                .recv_datagram(datagram)?;
+                .recv_datagram(datagram)
+                .await?;
         }
     }
 }
