@@ -1,22 +1,30 @@
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
+    coding::TrackNamespace,
     serve::{ServeError, TracksReader},
     session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
 };
 
-use crate::{Locals, RemoteManager};
+use crate::{lingering_subscriber::LingeringSubscriptionStore, Locals, RemoteManager};
 
 /// Producer of tracks to a remote Subscriber
 #[derive(Clone)]
 pub struct Producer {
+    lingering_subs: LingeringSubscriptionStore,
     publisher: Publisher,
     locals: Locals,
     remotes: RemoteManager,
 }
 
 impl Producer {
-    pub fn new(publisher: Publisher, locals: Locals, remotes: RemoteManager) -> Self {
+    pub fn new(
+        publisher: Publisher,
+        locals: Locals,
+        remotes: RemoteManager,
+        lingering_subs: LingeringSubscriptionStore,
+    ) -> Self {
         Self {
+            lingering_subs,
             publisher,
             locals,
             remotes,
@@ -34,6 +42,8 @@ impl Producer {
         let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
             FuturesUnordered::new();
 
+        // FIXME(itzmanish): this is hardcoded for 10s interval, we should make it configurable
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             let mut publisher_subscribed = self.publisher.clone();
             let mut publisher_track_status = self.publisher.clone();
@@ -45,7 +55,7 @@ impl Producer {
 
                     // Spawn a new task to handle the subscribe
                     tasks.push(async move {
-                        let info = subscribed.clone();
+                        let info = subscribed.info.clone();
                         log::info!("serving subscribe: {:?}", info);
 
                         // Serve the subscribe request
@@ -69,10 +79,74 @@ impl Producer {
                         }
                     }.boxed())
                 },
+                _ = timer.tick() => {
+                    // Check lingering subscriptions
+                    let this = self.clone();
+                    tasks.push(async move {
+                        let _ = this.check_lingering_subscriptions().await;
+                    }.boxed())
+                }
                 _= tasks.next(), if !tasks.is_empty() => {},
                 else => return Ok(()),
             };
         }
+    }
+
+    async fn check_lingering_subscriptions(&self) -> Result<(), SessionError> {
+        // Hold the lock for the entire iteration to avoid copying
+        let mut by_track = self.lingering_subs.lock().await;
+
+        // Collect keys to remove after processing (can't modify while iterating)
+        let mut subscriptions_to_remove: Vec<((TrackNamespace, String), u64)> = Vec::new();
+
+        for ((namespace, track_name), subscriptions) in by_track.iter() {
+            if self.locals.retrieve(namespace).is_none() {
+                continue;
+            }
+
+            for lingering_subscription in subscriptions.iter() {
+                if lingering_subscription.is_expired() {
+                    subscriptions_to_remove.push((
+                        (namespace.clone(), track_name.clone()),
+                        lingering_subscription.subscribed.id,
+                    ));
+                    continue;
+                }
+
+                if let Err(err) = self
+                    .clone()
+                    .serve_subscribe(lingering_subscription.subscribed.clone())
+                    .await
+                {
+                    log::warn!(
+                        "failed serving subscribe: {:?}, error: {}",
+                        lingering_subscription.subscribed.info,
+                        err
+                    );
+                } else {
+                    // Successfully served, mark for removal
+                    subscriptions_to_remove.push((
+                        (namespace.clone(), track_name.clone()),
+                        lingering_subscription.subscribed.id,
+                    ));
+                }
+            }
+        }
+
+        // Remove processed subscriptions
+        for ((namespace, track_name), subscription_id) in subscriptions_to_remove {
+            let key = (namespace, track_name);
+            if let Some(subscriptions) = by_track.get_mut(&key) {
+                if let Some(pos) = subscriptions
+                    .iter()
+                    .position(|sub| sub.subscribed.id == subscription_id)
+                {
+                    subscriptions.remove(pos);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Serve a subscribe request.
@@ -97,6 +171,22 @@ impl Producer {
         {
             log::info!("serving subscribe from remote: {:?}", track.info);
             return Ok(subscribed.serve(track).await?);
+        }
+
+        // NOTE(itzmanish): checking if we have subscription policy set for lingering
+        // on the request or globally on the relay
+        //
+        if self.lingering_subs.lingering_allowed().await {
+            if let Err(err) = self
+                .lingering_subs
+                .add_subscription(subscribed.clone())
+                .await
+            {
+                log::info!("failed to add lingering subscription: {}", err);
+            } else {
+                log::info!("lingering subscription added");
+                return Ok(());
+            }
         }
 
         // Track not found - close the subscription with not found error

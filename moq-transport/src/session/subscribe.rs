@@ -1,9 +1,9 @@
-use std::ops;
+use std::{ops, time::Instant};
 
 use crate::{
     coding::{KeyValuePairs, Location, TrackNamespace},
     data,
-    message::{self, FilterType, GroupOrder},
+    message::{self, FilterType, GroupOrder, LingerMode},
     serve::{self, ServeError, TrackWriter, TrackWriterMode},
 };
 
@@ -38,6 +38,8 @@ pub struct SubscribeInfo {
 
     // Set to true if this is a track_status request only
     pub track_status: bool,
+
+    pub linger_mode: LingerMode,
 }
 
 impl SubscribeInfo {
@@ -54,6 +56,7 @@ impl SubscribeInfo {
             end_group_id: msg.end_group_id,
             params: msg.params.clone(),
             track_status: false,
+            linger_mode: msg.linger_mode,
         }
     }
 }
@@ -101,6 +104,7 @@ impl Subscribe {
             start_location: None,
             end_group_id: None,
             params: Default::default(),
+            linger_mode: LingerMode::Disabled,
         };
         let info = SubscribeInfo::new_from_subscribe(&subscribe_message);
 

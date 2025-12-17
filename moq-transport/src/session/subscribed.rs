@@ -42,6 +42,7 @@ impl Default for SubscribedState {
     }
 }
 
+#[derive(Clone)]
 pub struct Subscribed {
     /// The sessions Publisher manager, used to send control messages,
     /// create new QUIC streams, and send datagrams

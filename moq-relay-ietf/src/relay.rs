@@ -6,7 +6,10 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic::{self, Endpoint};
 use url::Url;
 
-use crate::{Consumer, Coordinator, Locals, Producer, RemoteManager, Session};
+use crate::{
+    lingering_subscriber::{self, LingeringConfig, LingeringSubscriptionStore},
+    Consumer, Coordinator, Locals, Producer, RemoteManager, Session,
+};
 
 // A type alias for boxed future
 type ServerFuture = Pin<
@@ -56,6 +59,7 @@ pub struct Relay {
     locals: Locals,
     remotes: RemoteManager,
     coordinator: Arc<dyn Coordinator>,
+    lingering_store: LingeringSubscriptionStore,
 }
 
 impl Relay {
@@ -101,6 +105,10 @@ impl Relay {
         // Create remote manager - uses coordinator for namespace lookups
         let remotes = RemoteManager::new(config.coordinator.clone(), remote_clients)?;
 
+        let lingering_subscriber_config = LingeringConfig::default();
+        let lingering_subscriber_store =
+            LingeringSubscriptionStore::new(lingering_subscriber_config);
+
         Ok(Self {
             quic_endpoints: endpoints,
             announce_url: config.announce,
@@ -108,6 +116,7 @@ impl Relay {
             locals,
             remotes,
             coordinator: config.coordinator,
+            lingering_store: lingering_subscriber_store,
         })
     }
 
@@ -136,12 +145,14 @@ impl Relay {
 
             // Create a normal looking session, except we never forward or register announces.
             let coordinator = self.coordinator.clone();
+            let lingering_store = self.lingering_store.clone();
             let session = Session {
                 session,
                 producer: Some(Producer::new(
                     publisher,
                     self.locals.clone(),
                     remotes.clone(),
+                    lingering_store,
                 )),
                 consumer: Some(Consumer::new(
                     subscriber,
@@ -209,6 +220,7 @@ impl Relay {
                     let remotes = remotes.clone();
                     let forward = forward_producer.clone();
                     let coordinator = self.coordinator.clone();
+                    let lingering_store = self.lingering_store.clone();
 
                     // Spawn a new task to handle the connection
                     tasks.push(async move {
@@ -225,7 +237,7 @@ impl Relay {
                         let moq_session = session;
                         let session = Session {
                             session: moq_session,
-                            producer: publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes)),
+                            producer: publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, lingering_store)),
                             consumer: subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward)),
                         };
 

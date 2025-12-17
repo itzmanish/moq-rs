@@ -31,6 +31,7 @@
 mod api;
 mod consumer;
 mod coordinator;
+mod lingering_subscriber;
 mod local;
 mod producer;
 mod relay;

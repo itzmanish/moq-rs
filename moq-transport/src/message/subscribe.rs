@@ -1,8 +1,71 @@
+use std::time::Duration;
+
 use crate::coding::{
     Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location, TrackNamespace,
 };
 use crate::message::FilterType;
 use crate::message::GroupOrder;
+
+/// Extended subscription parameters for lingering
+pub mod subscribe_params {
+    use std::time::Duration;
+
+    use crate::{
+        coding::{KeyValuePairs, Value},
+        message::LingerMode,
+    };
+
+    /// Parameter key for linger mode
+    pub const LINGER_MODE: u64 = 0x4C494E47; // "LING" in ASCII
+
+    /// Parameter key for linger timeout (in milliseconds)
+    pub const LINGER_TIMEOUT: u64 = 0x4C54494D; // "LTIM" in ASCII
+
+    pub fn is_linger_enabled(kvps: &KeyValuePairs) -> bool {
+        let mode = kvps.get(LINGER_MODE);
+        if mode.is_none() {
+            return false;
+        }
+        let mode = mode.unwrap();
+        mode.key == LINGER_MODE
+    }
+
+    pub fn get_linger_timeout(kvps: &KeyValuePairs) -> Option<Duration> {
+        let timeout = kvps.get(LINGER_TIMEOUT)?;
+
+        if timeout.key != LINGER_TIMEOUT {
+            return None;
+        }
+        match timeout.value {
+            Value::IntValue(v) => Some(Duration::from_millis(v)),
+            _ => None,
+        }
+    }
+
+    pub fn get_linger_mode(kvps: &KeyValuePairs) -> LingerMode {
+        if is_linger_enabled(kvps) {
+            if let Some(timeout) = get_linger_timeout(kvps) {
+                LingerMode::EnabledWithTimeout(timeout)
+            } else {
+                LingerMode::Enabled
+            }
+        } else {
+            LingerMode::Disabled
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum LingerMode {
+    /// Do not linger, return error immediately if track not found
+    #[default]
+    Disabled,
+    /// Linger until timeout, using relay default timeout
+    Enabled,
+    /// Linger with custom timeout
+    EnabledWithTimeout(Duration),
+}
 
 /// Sent by the subscriber to request all future objects for the given track.
 ///
@@ -33,6 +96,8 @@ pub struct Subscribe {
 
     /// Optional parameters
     pub params: KeyValuePairs,
+
+    pub linger_mode: LingerMode,
 }
 
 impl Decode for Subscribe {
@@ -67,6 +132,8 @@ impl Decode for Subscribe {
 
         let params = KeyValuePairs::decode(r)?;
 
+        let linger_mode = subscribe_params::get_linger_mode(&params);
+
         Ok(Self {
             id,
             track_namespace,
@@ -78,6 +145,7 @@ impl Decode for Subscribe {
             start_location,
             end_group_id,
             params,
+            linger_mode,
         })
     }
 }
@@ -150,6 +218,7 @@ mod tests {
             start_location: None,
             end_group_id: None,
             params: kvps.clone(),
+            linger_mode: LingerMode::Disabled,
         };
         msg.encode(&mut buf).unwrap();
         let decoded = Subscribe::decode(&mut buf).unwrap();
@@ -167,6 +236,7 @@ mod tests {
             start_location: Some(Location::new(12345, 67890)),
             end_group_id: None,
             params: kvps.clone(),
+            linger_mode: LingerMode::Disabled,
         };
         msg.encode(&mut buf).unwrap();
         let decoded = Subscribe::decode(&mut buf).unwrap();
@@ -184,6 +254,7 @@ mod tests {
             start_location: Some(Location::new(12345, 67890)),
             end_group_id: Some(23456),
             params: kvps.clone(),
+            linger_mode: LingerMode::Disabled,
         };
         msg.encode(&mut buf).unwrap();
         let decoded = Subscribe::decode(&mut buf).unwrap();
@@ -206,6 +277,7 @@ mod tests {
             start_location: None,
             end_group_id: None,
             params: Default::default(),
+            linger_mode: LingerMode::Disabled,
         };
         let encoded = msg.encode(&mut buf);
         assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
@@ -222,6 +294,7 @@ mod tests {
             start_location: None,
             end_group_id: None,
             params: Default::default(),
+            linger_mode: LingerMode::Disabled,
         };
         let encoded = msg.encode(&mut buf);
         assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
@@ -238,6 +311,7 @@ mod tests {
             start_location: Some(Location::new(12345, 67890)),
             end_group_id: None,
             params: Default::default(),
+            linger_mode: LingerMode::Disabled,
         };
         let encoded = msg.encode(&mut buf);
         assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
