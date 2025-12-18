@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.6.0...moq-native-ietf-v0.7.0) - 2025-12-18
+
+### Other
+
+- Merge pull request #118 from itzmanish/feat/multi-relay
+
 ## [0.6.0](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.5.5...moq-native-ietf-v0.6.0) - 2025-12-18
 
 ### Other

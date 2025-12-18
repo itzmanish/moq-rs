@@ -6,6 +6,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.7](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.6...moq-relay-ietf-v0.7.7) - 2025-12-18
+
+### Added
+
+- add file-based coordinator and rewrote remote for handling remote streams
+
+### Fixed
+
+- ci
+- linter
+- seperate RemoteManager rewrite to different PR
+- remove once_cell to pass the test
+- clippy unused imports
+- clippy warnings
+- race and proper task shutdown
+- if host is IpAddr construct socket addr else resolve dns
+- update lookup signature to return owned Client instead of reference
+- prevent file truncation when opening for read/write in FileCoordinator
+- add lifetime parameter to lookup method signature for proper borrow checking
+- return clients on lookup for coordinator and misc fix
+
+### Other
+
+- Merge pull request #118 from itzmanish/feat/multi-relay
+- remove track registration from coordinator interface and file implementation
+- clarify coordinator file usage in CLI help text and add FIXME for unregister_namespace
+- restructure relay into lib/bin and add coordinator interface
+
 ## [0.7.6](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.5...moq-relay-ietf-v0.7.6) - 2025-12-18
 
 ### Other

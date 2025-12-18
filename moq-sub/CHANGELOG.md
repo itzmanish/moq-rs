@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/cloudflare/moq-rs/compare/moq-sub-v0.4.0...moq-sub-v0.4.1) - 2025-12-18
+
+### Other
+
+- Merge pull request #118 from itzmanish/feat/multi-relay
+
 ## [0.4.0](https://github.com/cloudflare/moq-rs/compare/moq-sub-v0.3.4...moq-sub-v0.4.0) - 2025-12-18
 
 ### Other
