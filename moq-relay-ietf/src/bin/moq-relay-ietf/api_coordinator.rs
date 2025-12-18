@@ -186,7 +186,7 @@ impl Coordinator for ApiCoordinator {
             .set_origin(&namespace_str, origin)
             .await
             .context("failed to register namespace in API")
-            .map_err(|e| CoordinatorError::Other(e))?;
+            .map_err(CoordinatorError::Other)?;
 
         // Create shutdown channel for the refresh task
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -217,7 +217,7 @@ impl Coordinator for ApiCoordinator {
             .delete_origin(&namespace_str)
             .await
             .context("failed to unregister namespace from API")
-            .map_err(|e| CoordinatorError::Other(e))?;
+            .map_err(CoordinatorError::Other)?;
 
         Ok(())
     }
@@ -235,7 +235,7 @@ impl Coordinator for ApiCoordinator {
             .get_origin(&namespace_str)
             .await
             .context("failed to lookup namespace in API")
-            .map_err(|e| CoordinatorError::Other(e))?;
+            .map_err(CoordinatorError::Other)?;
 
         match result {
             Some(origin) => {
