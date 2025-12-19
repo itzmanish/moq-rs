@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::net::SocketAddr;
 use std::ops;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -151,6 +152,7 @@ impl RemotesConsumer {
         let remote = Remote {
             url: origin.url(),
             remotes: self.info.clone(),
+            addr: origin.addr(),
             client,
         };
 
@@ -176,6 +178,7 @@ impl ops::Deref for RemotesConsumer {
 pub struct Remote {
     pub remotes: Arc<Remotes>,
     pub url: Url,
+    pub addr: Option<SocketAddr>,
     pub client: Option<quic::Client>,
 }
 
@@ -231,7 +234,7 @@ impl RemoteProducer {
             &self.quic
         };
         // TODO reuse QUIC and MoQ sessions
-        let (session, _quic_client_initial_cid) = client.connect(&self.url, None).await?;
+        let (session, _quic_client_initial_cid) = client.connect(&self.url, self.addr).await?;
         let (session, subscriber) = moq_transport::session::Subscriber::connect(session).await?;
 
         // Run the session
