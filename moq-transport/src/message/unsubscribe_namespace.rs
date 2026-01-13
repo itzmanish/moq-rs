@@ -1,24 +1,22 @@
-use crate::coding::{Decode, DecodeError, Encode, EncodeError, TrackNamespace};
+use crate::coding::{Decode, DecodeError, Encode, EncodeError, TrackNamespace, VarInt};
 
 /// Unsubscribe Namespace
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnsubscribeNamespace {
-    // Echo back the track namespace prefix from subscribe namespace
-    pub track_namespace_prefix: TrackNamespace,
+    // reqeust id of the subscribe_namespace being cancelled by this message
+    pub request_id: VarInt,
 }
 
 impl Decode for UnsubscribeNamespace {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-        let track_namespace_prefix = TrackNamespace::decode(r)?;
-        Ok(Self {
-            track_namespace_prefix,
-        })
+        let request_id = VarInt::decode(r)?;
+        Ok(Self { request_id })
     }
 }
 
 impl Encode for UnsubscribeNamespace {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        self.track_namespace_prefix.encode(w)?;
+        self.request_id.encode(w)?;
         Ok(())
     }
 }
@@ -33,7 +31,7 @@ mod tests {
         let mut buf = BytesMut::new();
 
         let msg = UnsubscribeNamespace {
-            track_namespace_prefix: TrackNamespace::from_utf8_path("test/path/to/resource"),
+            request_id: 1u32.into(),
         };
         msg.encode(&mut buf).unwrap();
         let decoded = UnsubscribeNamespace::decode(&mut buf).unwrap();
