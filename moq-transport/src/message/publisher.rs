@@ -54,6 +54,5 @@ publisher_msgs! {
     TrackStatusOk,
     FetchOk,
     RequestOk,
-    SubscribeNamespaceError,
     RequestError,
 }

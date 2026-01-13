@@ -239,20 +239,12 @@ impl Publisher {
             message::Subscriber::SubscribeNamespace(_msg) => {
                 Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE"))
             }
-            message::Subscriber::UnsubscribeNamespace(_msg) => {
-                Err(SessionError::unimplemented("UNSUBSCRIBE_NAMESPACE"))
-            }
             message::Subscriber::PublishNamespaceCancel(msg) => {
                 self.recv_publish_namespace_cancel(msg)
             }
             message::Subscriber::RequestOk(msg) => self.recv_request_ok(msg),
-            message::Subscriber::PublishNamespaceError(msg) => {
-                self.recv_publish_namespace_error(msg)
-            }
             message::Subscriber::PublishOk(_msg) => Err(SessionError::unimplemented("PUBLISH_OK")),
-            message::Subscriber::RequestError(_msg) => {
-                Err(SessionError::unimplemented("REQUEST ERROR"))
-            }
+            message::Subscriber::RequestError(msg) => self.recv_request_error(msg),
         };
 
         if let Err(err) = res {
@@ -278,13 +270,10 @@ impl Publisher {
         Ok(())
     }
 
-    fn recv_publish_namespace_error(
-        &mut self,
-        msg: message::PublishNamespaceError,
-    ) -> Result<(), SessionError> {
-        // We need to find the announce request using the request id, however the self.announces data structure
-        // is a HashMap indexed by Namespace (which is needed for handling PUBLISH_NAMESPACE_CANCEL).  TODO - make more efficient.
-        // For now iterate through all self.annouces until we find the matching id.
+    fn recv_request_error(&mut self, msg: message::RequestError) -> Result<(), SessionError> {
+        // REQUEST_ERROR is the unified error response for multiple request types.
+        // We need to find the request using the request id. Currently we check announces.
+        // TODO: Also check other request types (subscribe_namespace, etc.) when implemented.
         let mut announces = self.announces.lock().unwrap();
 
         // Find the key first (immutable borrow only)
@@ -296,7 +285,6 @@ impl Publisher {
         // Remove from HashMap and take ownership
         if let Some(key) = key_opt {
             if let Some((_ns, v)) = announces.remove_entry(&key) {
-                // Step 3: call recv_error, consuming v
                 v.recv_error(ServeError::Closed(msg.error_code))?;
             }
         }

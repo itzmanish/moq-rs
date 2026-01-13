@@ -129,8 +129,6 @@ impl Subscriber {
             message::Subscriber::PublishNamespaceCancel(msg) => {
                 self.drop_publish_namespace(&msg.track_namespace)
             }
-            // TODO SLG - there is no longer a namespace in the error, need to map via request id
-            message::Subscriber::PublishNamespaceError(_msg) => {} // Not implemented yet - need request id mapping
             _ => {}
         }
 
@@ -150,9 +148,6 @@ impl Subscriber {
             message::Publisher::TrackStatusOk(msg) => self.recv_track_status_ok(msg),
             message::Publisher::FetchOk(_msg) => Err(SessionError::unimplemented("FETCH_OK")),
             message::Publisher::RequestOk(_msg) => Err(SessionError::unimplemented("REQUEST_OK")),
-            message::Publisher::SubscribeNamespaceError(_msg) => {
-                Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE_ERROR"))
-            }
         };
 
         if let Err(SessionError::Serve(err)) = res {

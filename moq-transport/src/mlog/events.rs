@@ -2,9 +2,9 @@
 // - SubscribeUpdate (parsed/created)
 // - PublishNamespaceDone (parsed/created)
 // - PublishNamespaceCancel (parsed/created)
-// - TrackStatus, TrackStatusOk, TrackStatusError (parsed/created)
-// - SubscribeNamespace, SubscribeNamespaceOk, SubscribeNamespaceError, UnsubscribeNamespace (parsed/created)
-// - Fetch, FetchOk, FetchError, FetchCancel (parsed/created)
+// - TrackStatus, TrackStatusOk (parsed/created)
+// - SubscribeNamespace (parsed/created)
+// - Fetch, FetchOk, FetchCancel (parsed/created)
 // - Publish, PublishOk, PublishError, PublishDone (parsed/created)
 // - MaxRequestId (parsed/created)
 // - RequestsBlocked (parsed/created)
@@ -376,45 +376,6 @@ pub fn reqeust_ok_created(time: f64, stream_id: u64, msg: &message::RequestOk) -
         false,
         "request_ok",
         request_ok_to_json(msg),
-    )
-}
-
-/// Helper to convert PUBLISH_NAMESPACE_ERROR message to JSON
-fn publish_namespace_error_to_json(msg: &message::PublishNamespaceError) -> JsonValue {
-    json!({
-        "request_id": msg.id,
-        "error_code": msg.error_code,
-        "reason_phrase": &msg.reason_phrase.0,
-    })
-}
-
-/// Create a control_message_parsed event for PUBLISH_NAMESPACE_ERROR (was ANNOUNCE_ERROR)
-pub fn publish_namespace_error_parsed(
-    time: f64,
-    stream_id: u64,
-    msg: &message::PublishNamespaceError,
-) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        true,
-        "publish_namespace_error",
-        publish_namespace_error_to_json(msg),
-    )
-}
-
-/// Create a control_message_created event for PUBLISH_NAMESPACE_ERROR
-pub fn publish_namespace_error_created(
-    time: f64,
-    stream_id: u64,
-    msg: &message::PublishNamespaceError,
-) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        false,
-        "publish_namespace_error",
-        publish_namespace_error_to_json(msg),
     )
 }
 

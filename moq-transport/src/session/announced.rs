@@ -99,7 +99,7 @@ impl Drop for Announced {
                 reason_phrase: ReasonPhrase(err.to_string()),
             });
         } else {
-            self.session.send_message(message::PublishNamespaceError {
+            self.session.send_message(message::RequestError {
                 id: self.info.request_id,
                 error_code: err.code(),
                 reason_phrase: ReasonPhrase(err.to_string()),

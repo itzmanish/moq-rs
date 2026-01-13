@@ -7,7 +7,6 @@
 
 mod fetch;
 mod fetch_cancel;
-mod fetch_error;
 mod fetch_ok;
 mod fetch_type;
 mod filter_type;
@@ -20,7 +19,6 @@ mod publish;
 mod publish_done;
 mod publish_namespace;
 mod publish_namespace_cancel;
-mod publish_namespace_error;
 mod publish_ok;
 mod publisher;
 mod request_error;
@@ -28,18 +26,15 @@ mod request_ok;
 mod requests_blocked;
 mod subscribe;
 mod subscribe_namespace;
-mod subscribe_namespace_error;
 mod subscribe_ok;
 mod subscribe_update;
 mod subscriber;
 mod track_status;
 mod track_status_ok;
 mod unsubscribe;
-mod unsubscribe_namespace;
 
 pub use fetch::*;
 pub use fetch_cancel::*;
-pub use fetch_error::*;
 pub use fetch_ok::*;
 pub use fetch_type::*;
 pub use filter_type::*;
@@ -52,7 +47,6 @@ pub use publish::*;
 pub use publish_done::*;
 pub use publish_namespace::*;
 pub use publish_namespace_cancel::*;
-pub use publish_namespace_error::*;
 pub use publish_ok::*;
 pub use publisher::*;
 pub use request_error::*;
@@ -60,14 +54,12 @@ pub use request_ok::*;
 pub use requests_blocked::*;
 pub use subscribe::*;
 pub use subscribe_namespace::*;
-pub use subscribe_namespace_error::*;
 pub use subscribe_ok::*;
 pub use subscribe_update::*;
 pub use subscriber::*;
 pub use track_status::*;
 pub use track_status_ok::*;
 pub use unsubscribe::*;
-pub use unsubscribe_namespace::*;
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use std::fmt;
@@ -187,7 +179,6 @@ message_types! {
     PublishNamespaceDone = 0x9,
     // ANNOUNCE family, sent by subscriber
     RequestOk = 0x7,
-    PublishNamespaceError = 0x8,
     PublishNamespaceCancel = 0xc,
 
     // TRACK_STATUS family, sent by subscriber
@@ -197,9 +188,6 @@ message_types! {
 
     // NAMESPACE family, sent by subscriber
     SubscribeNamespace = 0x11,
-    UnsubscribeNamespace = 0x14,
-    // NAMESPACE family, sent by publisher
-    SubscribeNamespaceError = 0x13,
 
     // FETCH family, sent by subscriber
     Fetch = 0x16,

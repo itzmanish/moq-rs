@@ -216,9 +216,6 @@ impl Session {
                         Message::RequestOk(m) => {
                             Some(mlog::events::reqeust_ok_created(time, stream_id, m))
                         }
-                        Message::PublishNamespaceError(m) => Some(
-                            mlog::events::publish_namespace_error_created(time, stream_id, m),
-                        ),
                         Message::GoAway(m) => {
                             Some(mlog::events::go_away_created(time, stream_id, m))
                         }
@@ -278,9 +275,6 @@ impl Session {
                         Message::RequestOk(m) => {
                             Some(mlog::events::request_ok_parsed(time, stream_id, m))
                         }
-                        Message::PublishNamespaceError(m) => Some(
-                            mlog::events::publish_namespace_error_parsed(time, stream_id, m),
-                        ),
                         Message::GoAway(m) => {
                             Some(mlog::events::go_away_parsed(time, stream_id, m))
                         }
