@@ -125,11 +125,8 @@ impl Subscriber {
         let msg = msg.into();
 
         // Remove our entry on terminal state.
-        match &msg {
-            message::Subscriber::PublishNamespaceCancel(msg) => {
-                self.drop_publish_namespace(&msg.track_namespace)
-            }
-            _ => {}
+        if let message::Subscriber::PublishNamespaceCancel(msg) = &msg {
+            self.drop_publish_namespace(&msg.track_namespace)
         }
 
         // TODO report dropped messages?
