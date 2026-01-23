@@ -23,9 +23,13 @@ impl Producer {
         }
     }
 
-    /// Announce new tracks to the remote server.
+    pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
+        self.publisher.publish_namespace(tracks).await
+    }
+
+    #[deprecated(note = "Use publish_namespace() instead")]
     pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-        self.publisher.announce(tracks).await
+        self.publish_namespace(tracks).await
     }
 
     /// Run the producer to serve subscribe requests.

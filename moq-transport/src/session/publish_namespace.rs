@@ -7,19 +7,19 @@ use crate::{message, serve::ServeError};
 use super::{Publisher, Subscribed, TrackStatusRequested};
 
 #[derive(Debug, Clone)]
-pub struct AnnounceInfo {
+pub struct PublishNamespaceInfo {
     pub request_id: u64,
     pub namespace: TrackNamespace,
 }
 
-struct AnnounceState {
+struct PublishNamespaceState {
     subscribers: VecDeque<Subscribed>,
     track_statuses_requested: VecDeque<TrackStatusRequested>,
     ok: bool,
     closed: Result<(), ServeError>,
 }
 
-impl Default for AnnounceState {
+impl Default for PublishNamespaceState {
     fn default() -> Self {
         Self {
             subscribers: Default::default(),
@@ -30,33 +30,35 @@ impl Default for AnnounceState {
     }
 }
 
-impl Drop for AnnounceState {
+impl Drop for PublishNamespaceState {
     fn drop(&mut self) {
         for subscriber in self.subscribers.drain(..) {
             subscriber
                 .close(ServeError::not_found_ctx(
-                    "announce dropped before subscription handled",
+                    "publish_namespace dropped before subscription handled",
                 ))
                 .ok();
         }
     }
 }
 
-#[must_use = "unannounce on drop"]
-pub struct Announce {
+/// Represents an outbound PUBLISH_NAMESPACE request (publisher side).
+/// When dropped, sends PUBLISH_NAMESPACE_DONE to the peer.
+#[must_use = "sends PUBLISH_NAMESPACE_DONE on drop"]
+pub struct PublishNamespace {
     publisher: Publisher,
-    state: State<AnnounceState>,
+    state: State<PublishNamespaceState>,
 
-    pub info: AnnounceInfo,
+    pub info: PublishNamespaceInfo,
 }
 
-impl Announce {
+impl PublishNamespace {
     pub(super) fn new(
         mut publisher: Publisher,
         request_id: u64,
         namespace: TrackNamespace,
-    ) -> (Announce, AnnounceRecv) {
-        let info = AnnounceInfo {
+    ) -> (PublishNamespace, PublishNamespaceRecv) {
+        let info = PublishNamespaceInfo {
             request_id,
             namespace: namespace.clone(),
         };
@@ -74,7 +76,7 @@ impl Announce {
             info,
             state: send,
         };
-        let recv = AnnounceRecv {
+        let recv = PublishNamespaceRecv {
             state: recv,
             request_id,
         };
@@ -82,7 +84,6 @@ impl Announce {
         (send, recv)
     }
 
-    // Run until we get an error
     pub async fn closed(&self) -> Result<(), ServeError> {
         loop {
             {
@@ -139,7 +140,6 @@ impl Announce {
         }
     }
 
-    // Wait until an OK is received
     pub async fn ok(&self) -> Result<(), ServeError> {
         loop {
             {
@@ -159,7 +159,7 @@ impl Announce {
     }
 }
 
-impl Drop for Announce {
+impl Drop for PublishNamespace {
     fn drop(&mut self) {
         if self.state.lock().closed.is_err() {
             return;
@@ -171,20 +171,20 @@ impl Drop for Announce {
     }
 }
 
-impl ops::Deref for Announce {
-    type Target = AnnounceInfo;
+impl ops::Deref for PublishNamespace {
+    type Target = PublishNamespaceInfo;
 
     fn deref(&self) -> &Self::Target {
         &self.info
     }
 }
 
-pub(super) struct AnnounceRecv {
-    state: State<AnnounceState>,
-    pub request_id: u64, // TODO SLG - Announcements need to be looked up by both request_id and namespace, consider 2 hashmaps in publisher instead of this
+pub(super) struct PublishNamespaceRecv {
+    state: State<PublishNamespaceState>,
+    pub request_id: u64,
 }
 
-impl AnnounceRecv {
+impl PublishNamespaceRecv {
     pub fn recv_ok(&mut self) -> Result<(), ServeError> {
         if let Some(mut state) = self.state.lock_mut() {
             if state.ok {
@@ -225,3 +225,5 @@ impl AnnounceRecv {
         Ok(())
     }
 }
+
+

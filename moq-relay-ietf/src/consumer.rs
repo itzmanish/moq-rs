@@ -4,7 +4,7 @@ use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
     serve::Tracks,
-    session::{Announced, SessionError, Subscriber},
+    session::{PublishNamespaceReceived, SessionError, Subscriber},
 };
 
 use crate::{Coordinator, Locals, Producer};
@@ -39,17 +39,15 @@ impl Consumer {
 
         loop {
             tokio::select! {
-                // Handle a new announce request
-                Some(announce) = self.subscriber.announced() => {
+                Some(publish_ns) = self.subscriber.publish_ns_recvd() => {
                     let this = self.clone();
 
                     tasks.push(async move {
-                        let info = announce.clone();
-                        log::info!("serving announce: {:?}", info);
+                        let info = publish_ns.clone();
+                        log::info!("serving publish_namespace: {:?}", info);
 
-                        // Serve the announce request
-                        if let Err(err) = this.serve(announce).await {
-                            log::warn!("failed serving announce: {:?}, error: {}", info, err)
+                        if let Err(err) = this.serve(publish_ns).await {
+                            log::warn!("failed serving publish_namespace: {:?}, error: {}", info, err)
                         }
                     });
                 },
@@ -59,12 +57,13 @@ impl Consumer {
         }
     }
 
-    /// Serve an announce request.
-    async fn serve(mut self, mut announce: Announced) -> Result<(), anyhow::Error> {
+    async fn serve(
+        mut self,
+        mut publish_ns: PublishNamespaceReceived,
+    ) -> Result<(), anyhow::Error> {
         let mut tasks = FuturesUnordered::new();
 
-        // Produce the tracks for this announce and return the reader
-        let (_, mut request, reader) = Tracks::new(announce.namespace.clone()).produce();
+        let (_, mut request, reader) = Tracks::new(publish_ns.namespace.clone()).produce();
 
         // NOTE(mpandit): once the track is pulled from origin, internally it will be relayed
         // from this metal only, because now coordinator will have entry for the namespace.
@@ -80,18 +79,17 @@ impl Consumer {
         // Register the local tracks, unregister on drop
         let _register = self.locals.register(reader.clone()).await?;
 
-        // Accept the announce with an OK response
-        announce.ok()?;
+        publish_ns.ok()?;
 
         // Forward the announce, if needed
         if let Some(mut forward) = self.forward {
             tasks.push(
                 async move {
-                    log::info!("forwarding announce: {:?}", reader.info);
+                    log::info!("forwarding publish_namespace: {:?}", reader.info);
                     forward
-                        .announce(reader)
+                        .publish_namespace(reader)
                         .await
-                        .context("failed forwarding announce")
+                        .context("failed forwarding publish_namespace")
                 }
                 .boxed(),
             );
@@ -100,8 +98,7 @@ impl Consumer {
         // Serve subscribe requests
         loop {
             tokio::select! {
-                // If the announce is closed, return the error
-                Err(err) = announce.closed() => return Err(err.into()),
+                Err(err) = publish_ns.closed() => return Err(err.into()),
 
                 // Wait for the next subscriber and serve the track.
                 Some(track) = request.next() => {

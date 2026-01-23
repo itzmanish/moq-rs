@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
             tokio::select! {
                 res = session.run() => res.context("session error")?,
                 res = clock_publisher.run() => res.context("clock error")?,
-                res = publisher.announce(tracks_reader) => res.context("failed to serve tracks")?,
+                res = publisher.publish_namespace(tracks_reader) => res.context("failed to serve tracks")?,
             }
         } else {
             log::info!("publishing clock via streams");
@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
             tokio::select! {
                 res = session.run() => res.context("session error")?,
                 res = clock_publisher.run() => res.context("clock error")?,
-                res = publisher.announce(tracks_reader) => res.context("failed to serve tracks")?,
+                res = publisher.publish_namespace(tracks_reader) => res.context("failed to serve tracks")?,
             }
         }
     } else {
