@@ -1,13 +1,13 @@
 use std::{
-    collections::{hash_map, HashMap},
+    collections::{hash_map, HashMap, HashSet},
     sync::{atomic, Arc, Mutex},
 };
 
 use futures::{stream::FuturesUnordered, StreamExt};
 
 use crate::{
-    coding::TrackNamespace,
-    message::{self, GroupOrder, Message},
+    coding::{ReasonPhrase, TrackNamespace},
+    message::{self, GroupOrder, Message, SubscribeNamespaceError, SubscribeNamespaceOk},
     mlog,
     serve::{self, ServeError, TracksReader},
 };
@@ -24,6 +24,8 @@ pub struct Publisher {
     webtransport: web_transport::Session,
 
     publish_namespaces: Arc<Mutex<HashMap<TrackNamespace, PublishNamespaceRecv>>>,
+
+    filtered_namespaces: Arc<Mutex<HashSet<TrackNamespace>>>,
 
     subscribeds: Arc<Mutex<HashMap<u64, SubscribedRecv>>>,
 
@@ -52,6 +54,7 @@ impl Publisher {
         Self {
             webtransport,
             publish_namespaces: Default::default(),
+            filtered_namespaces: Default::default(),
             subscribeds: Default::default(),
             unknown_subscribed: Default::default(),
             unknown_track_status_requested: Default::default(),
@@ -78,6 +81,15 @@ impl Publisher {
     }
 
     pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
+        if self
+            .filtered_namespaces
+            .lock()
+            .unwrap()
+            .contains(&tracks.namespace)
+        {
+            return Ok(());
+        }
+
         let publish_ns = match self
             .publish_namespaces
             .lock()
@@ -195,7 +207,9 @@ impl Publisher {
 
     pub async fn publish(&mut self, track: serve::TrackReader) -> Result<Published, SessionError> {
         let request_id = self.next_requestid.fetch_add(2, atomic::Ordering::Relaxed);
-        let track_alias = self.next_track_alias.fetch_add(1, atomic::Ordering::Relaxed);
+        let track_alias = self
+            .next_track_alias
+            .fetch_add(1, atomic::Ordering::Relaxed);
 
         let largest_location = track.largest_location();
         let content_exists = largest_location.is_some();
@@ -226,7 +240,9 @@ impl Publisher {
         forward: bool,
     ) -> Result<Published, SessionError> {
         let request_id = self.next_requestid.fetch_add(2, atomic::Ordering::Relaxed);
-        let track_alias = self.next_track_alias.fetch_add(1, atomic::Ordering::Relaxed);
+        let track_alias = self
+            .next_track_alias
+            .fetch_add(1, atomic::Ordering::Relaxed);
 
         let largest_location = track.largest_location();
         let content_exists = largest_location.is_some();
@@ -260,12 +276,8 @@ impl Publisher {
                 Err(SessionError::unimplemented("FETCH_CANCEL"))
             }
             message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg),
-            message::Subscriber::SubscribeNamespace(_msg) => {
-                Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE"))
-            }
-            message::Subscriber::UnsubscribeNamespace(_msg) => {
-                Err(SessionError::unimplemented("UNSUBSCRIBE_NAMESPACE"))
-            }
+            message::Subscriber::SubscribeNamespace(msg) => self.recv_subscribe_namespace(msg),
+            message::Subscriber::UnsubscribeNamespace(msg) => self.recv_unsubscribe_namespace(msg),
             message::Subscriber::PublishNamespaceCancel(msg) => {
                 self.recv_publish_namespace_cancel(msg)
             }
@@ -274,7 +286,7 @@ impl Publisher {
                 self.recv_publish_namespace_error(msg)
             }
             message::Subscriber::PublishOk(msg) => self.recv_publish_ok(msg),
-            message::Subscriber::PublishError(msg) => self.recv_publish_error(msg)
+            message::Subscriber::PublishError(msg) => self.recv_publish_error(msg),
         };
 
         if let Err(err) = res {
@@ -419,6 +431,75 @@ impl Publisher {
         if let Some(subscribed) = self.subscribeds.lock().unwrap().get_mut(&msg.id) {
             subscribed.recv_unsubscribe()?;
         }
+
+        Ok(())
+    }
+
+    fn recv_subscribe_namespace(
+        &mut self,
+        msg: message::SubscribeNamespace,
+    ) -> Result<(), SessionError> {
+        let namespace_prefix = msg.track_namespace_prefix.clone();
+
+        // remove the namespace from the filtered_namespaces
+        self.filtered_namespaces
+            .lock()
+            .unwrap()
+            .remove(&namespace_prefix);
+
+        let has = self
+            .publish_namespaces
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(n, _)| n == &namespace_prefix);
+
+        if !has {
+            self.send_message(SubscribeNamespaceError {
+                id: msg.id,
+                error_code: 0x4,
+                reason_phrase: ReasonPhrase("Namespace not found".to_string()),
+            });
+        } else {
+            self.send_message(SubscribeNamespaceOk { id: msg.id });
+        }
+
+        if self
+            .subscribeds
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, s)| s.get_namespace() == namespace_prefix)
+        {
+            self.send_message(SubscribeNamespaceError {
+                id: msg.id,
+                error_code: 0x5,
+                reason_phrase: ReasonPhrase("Namespace already subscribed".to_string()),
+            });
+        }
+
+        // Send the publish namespace request
+        let request_id = self.next_requestid.fetch_add(2, atomic::Ordering::Relaxed);
+        self.send_message(message::PublishNamespace {
+            id: request_id,
+            track_namespace: namespace_prefix,
+            params: Default::default(),
+        });
+
+        // FIXME: we should also send the publish message
+
+        Ok(())
+    }
+
+    fn recv_unsubscribe_namespace(
+        &mut self,
+        msg: message::UnsubscribeNamespace,
+    ) -> Result<(), SessionError> {
+        // set the namesapce into the filtered_namespaces
+        self.filtered_namespaces
+            .lock()
+            .unwrap()
+            .insert(msg.track_namespace_prefix.clone());
 
         Ok(())
     }

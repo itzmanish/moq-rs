@@ -19,7 +19,7 @@ use crate::watch::Queue;
 
 use super::{
     PublishNamespaceReceived, PublishNamespaceReceivedRecv, PublishReceived, PublishReceivedRecv,
-    Reader, Session, SessionError, Subscribe, SubscribeRecv,
+    Reader, Session, SessionError, Subscribe, SubscribeNs, SubscribeNsRecv, SubscribeRecv,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -30,6 +30,8 @@ pub struct Subscriber {
     publish_namespaces_received: Arc<Mutex<HashMap<TrackNamespace, PublishNamespaceReceivedRecv>>>,
 
     publish_namespace_received_queue: Queue<PublishNamespaceReceived>,
+
+    subscribe_namespaces: Arc<Mutex<HashMap<u64, SubscribeNsRecv>>>,
 
     subscribes: Arc<Mutex<HashMap<u64, SubscribeRecv>>>,
 
@@ -61,6 +63,7 @@ impl Subscriber {
         Self {
             publish_namespaces_received: Default::default(),
             publish_namespace_received_queue: Default::default(),
+            subscribe_namespaces: Default::default(),
             subscribes: Default::default(),
             subscribe_alias_map: Default::default(),
             subscribe_alias_notify: Arc::new(Notify::new()),
@@ -124,6 +127,24 @@ impl Subscriber {
         send.closed().await
     }
 
+    pub fn subscribe_ns(
+        &mut self,
+        namespace_prefix: TrackNamespace,
+    ) -> Result<SubscribeNs, ServeError> {
+        let request_id = self.get_next_request_id();
+
+        let mut subscribe_namespaces = self.subscribe_namespaces.lock().unwrap();
+        let entry = match subscribe_namespaces.entry(request_id) {
+            hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate),
+            hash_map::Entry::Vacant(entry) => entry,
+        };
+
+        let (send, recv) = SubscribeNs::new(self.clone(), request_id, namespace_prefix);
+        entry.insert(recv);
+
+        Ok(send)
+    }
+
     /// Send a message to the publisher via the control stream.
     pub(super) fn send_message<M: Into<message::Subscriber>>(&mut self, msg: M) {
         let msg = msg.into();
@@ -156,11 +177,9 @@ impl Subscriber {
             }
             message::Publisher::FetchOk(_msg) => Err(SessionError::unimplemented("FETCH_OK")),
             message::Publisher::FetchError(_msg) => Err(SessionError::unimplemented("FETCH_ERROR")),
-            message::Publisher::SubscribeNamespaceOk(_msg) => {
-                Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE_OK"))
-            }
-            message::Publisher::SubscribeNamespaceError(_msg) => {
-                Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE_ERROR"))
+            message::Publisher::SubscribeNamespaceOk(msg) => self.recv_subscribe_namespace_ok(msg),
+            message::Publisher::SubscribeNamespaceError(msg) => {
+                self.recv_subscribe_namespace_error(msg)
             }
         };
 
@@ -299,6 +318,28 @@ impl Subscriber {
     fn recv_track_status_ok(&mut self, _msg: &message::TrackStatusOk) -> Result<(), SessionError> {
         // TODO: Expose this somehow?
         // TODO: Also add a way to send a Track Status Request in the first place
+
+        Ok(())
+    }
+
+    fn recv_subscribe_namespace_ok(
+        &mut self,
+        msg: &message::SubscribeNamespaceOk,
+    ) -> Result<(), SessionError> {
+        if let Some(subscribe_ns) = self.subscribe_namespaces.lock().unwrap().get_mut(&msg.id) {
+            subscribe_ns.recv_ok()?;
+        }
+
+        Ok(())
+    }
+
+    fn recv_subscribe_namespace_error(
+        &mut self,
+        msg: &message::SubscribeNamespaceError,
+    ) -> Result<(), SessionError> {
+        if let Some(subscribe_ns) = self.subscribe_namespaces.lock().unwrap().remove(&msg.id) {
+            subscribe_ns.recv_error(ServeError::Closed(msg.error_code))?;
+        }
 
         Ok(())
     }
@@ -487,8 +528,12 @@ impl Subscriber {
                 })?;
 
                 if stream_header.header_type.is_subgroup() {
-                    log::trace!("[SUBSCRIBER] recv_stream_inner: creating subgroup writer from subscribe");
-                    Writer::Subgroup(subscribe.subgroup(stream_header.subgroup_header.clone().unwrap())?)
+                    log::trace!(
+                        "[SUBSCRIBER] recv_stream_inner: creating subgroup writer from subscribe"
+                    );
+                    Writer::Subgroup(
+                        subscribe.subgroup(stream_header.subgroup_header.clone().unwrap())?,
+                    )
                 } else {
                     return Err(SessionError::Serve(ServeError::internal_ctx(format!(
                         "unsupported stream header type={}",
@@ -508,8 +553,12 @@ impl Subscriber {
                 })?;
 
                 if stream_header.header_type.is_subgroup() {
-                    log::trace!("[SUBSCRIBER] recv_stream_inner: creating subgroup writer from publish");
-                    Writer::Subgroup(publish_recv.subgroup(stream_header.subgroup_header.clone().unwrap())?)
+                    log::trace!(
+                        "[SUBSCRIBER] recv_stream_inner: creating subgroup writer from publish"
+                    );
+                    Writer::Subgroup(
+                        publish_recv.subgroup(stream_header.subgroup_header.clone().unwrap())?,
+                    )
                 } else {
                     return Err(SessionError::Serve(ServeError::internal_ctx(format!(
                         "unsupported stream header type={}",
