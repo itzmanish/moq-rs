@@ -36,15 +36,6 @@ impl Producer {
             .await
     }
 
-    #[deprecated(note = "Use publish_namespace() instead")]
-    pub async fn announce(
-        &mut self,
-        tracks: TracksReader,
-    ) -> Result<PublishNamespace, SessionError> {
-        self.publish_namespace(tracks).await
-    }
-
-    /// Run the producer to serve subscribe requests.
     pub async fn run(self) -> Result<(), SessionError> {
         //let mut tasks = FuturesUnordered::new();
         let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
