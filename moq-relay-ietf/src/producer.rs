@@ -1,7 +1,11 @@
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
+    coding::TrackNamespace,
     serve::{ServeError, TracksReader},
-    session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
+    session::{
+        PublishNamespace, Publisher, SessionError, SubscribeNamespaceReceived, Subscribed,
+        TrackStatusRequested,
+    },
 };
 
 use crate::{Locals, RemotesConsumer};
@@ -23,12 +27,20 @@ impl Producer {
         }
     }
 
-    pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-        self.publisher.publish_namespace(tracks).await
+    pub async fn publish_namespace(
+        &mut self,
+        tracks: TracksReader,
+    ) -> Result<PublishNamespace, SessionError> {
+        self.publisher
+            .publish_namespace(tracks.namespace.clone())
+            .await
     }
 
     #[deprecated(note = "Use publish_namespace() instead")]
-    pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
+    pub async fn announce(
+        &mut self,
+        tracks: TracksReader,
+    ) -> Result<PublishNamespace, SessionError> {
         self.publish_namespace(tracks).await
     }
 
@@ -41,6 +53,7 @@ impl Producer {
         loop {
             let mut publisher_subscribed = self.publisher.clone();
             let mut publisher_track_status = self.publisher.clone();
+            let mut publisher_subscribe_ns = self.publisher.clone();
 
             tokio::select! {
                 // Handle a new subscribe request
@@ -70,6 +83,18 @@ impl Producer {
                         // Serve the track_status request
                         if let Err(err) = this.serve_track_status(track_status_requested).await {
                             log::warn!("failed serving track_status: {:?}, error: {}", info, err)
+                        }
+                    }.boxed())
+                },
+                Some(subscribe_ns) = publisher_subscribe_ns.subscribe_namespace_received() => {
+                    let this = self.clone();
+
+                    tasks.push(async move {
+                        let info = subscribe_ns.info.clone();
+                        log::info!("serving subscribe_namespace: {:?}", info);
+
+                        if let Err(err) = this.serve_subscribe_namespace(subscribe_ns).await {
+                            log::warn!("failed serving subscribe_namespace: {:?}, error: {}", info, err)
                         }
                     }.boxed())
                 },
@@ -118,7 +143,49 @@ impl Producer {
         Err(err.into())
     }
 
-    /// Serve a track_status request.
+    async fn serve_subscribe_namespace(
+        mut self,
+        mut subscribe_ns: SubscribeNamespaceReceived,
+    ) -> Result<(), anyhow::Error> {
+        let namespace_prefix = subscribe_ns.namespace_prefix.clone();
+
+        let matching_namespaces: Vec<TrackNamespace> = self
+            .locals
+            .matching_namespaces(&namespace_prefix)
+            .into_iter()
+            .collect();
+
+        if matching_namespaces.is_empty() {
+            subscribe_ns.reject(0x4, "Namespace prefix not found")?;
+            return Ok(());
+        }
+
+        subscribe_ns.ok()?;
+
+        for namespace in matching_namespaces {
+            log::info!(
+                "sending PUBLISH_NAMESPACE for {:?} (matched prefix {:?})",
+                namespace,
+                namespace_prefix
+            );
+            match self.publisher.publish_namespace(namespace.clone()).await {
+                Ok(_publish_ns) => {
+                    log::debug!("sent PUBLISH_NAMESPACE for {:?}", namespace);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "failed to send PUBLISH_NAMESPACE for {:?}: {}",
+                        namespace,
+                        e
+                    );
+                }
+            }
+        }
+
+        subscribe_ns.closed().await?;
+        Ok(())
+    }
+
     async fn serve_track_status(
         self,
         mut track_status_requested: TrackStatusRequested,

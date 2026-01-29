@@ -3,11 +3,9 @@ use std::{
     sync::{atomic, Arc, Mutex},
 };
 
-use futures::{stream::FuturesUnordered, StreamExt};
-
 use crate::{
-    coding::{ReasonPhrase, TrackNamespace},
-    message::{self, GroupOrder, Message, SubscribeNamespaceError, SubscribeNamespaceOk},
+    coding::TrackNamespace,
+    message::{self, GroupOrder, Message},
     mlog,
     serve::{self, ServeError, TracksReader},
 };
@@ -16,7 +14,8 @@ use crate::watch::Queue;
 
 use super::{
     PublishNamespace, PublishNamespaceRecv, Published, PublishedRecv, Session, SessionError,
-    Subscribed, SubscribedRecv, TrackStatusRequested,
+    SubscribeNamespaceReceived, SubscribeNamespaceReceivedRecv, Subscribed, SubscribedRecv,
+    TrackStatusRequested,
 };
 
 #[derive(Clone)]
@@ -32,6 +31,10 @@ pub struct Publisher {
     unknown_subscribed: Queue<Subscribed>,
 
     unknown_track_status_requested: Queue<TrackStatusRequested>,
+
+    subscribe_namespaces_received: Arc<Mutex<HashMap<u64, SubscribeNamespaceReceivedRecv>>>,
+
+    subscribe_namespace_received_queue: Queue<SubscribeNamespaceReceived>,
 
     publisheds: Arc<Mutex<HashMap<u64, PublishedRecv>>>,
 
@@ -58,6 +61,8 @@ impl Publisher {
             subscribeds: Default::default(),
             unknown_subscribed: Default::default(),
             unknown_track_status_requested: Default::default(),
+            subscribe_namespaces_received: Default::default(),
+            subscribe_namespace_received_queue: Default::default(),
             publisheds: Default::default(),
             next_track_alias: Arc::new(atomic::AtomicU64::new(1)),
             outgoing,
@@ -80,77 +85,37 @@ impl Publisher {
         Ok((session, publisher))
     }
 
-    pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
+    pub async fn publish_namespace(
+        &mut self,
+        namespace: TrackNamespace,
+    ) -> Result<PublishNamespace, SessionError> {
         if self
             .filtered_namespaces
             .lock()
             .unwrap()
-            .contains(&tracks.namespace)
+            .contains(&namespace)
         {
-            return Ok(());
+            return Err(ServeError::Cancel.into());
         }
 
         let publish_ns = match self
             .publish_namespaces
             .lock()
             .unwrap()
-            .entry(tracks.namespace.clone())
+            .entry(namespace.clone())
         {
             hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
 
             hash_map::Entry::Vacant(entry) => {
                 let request_id = self.next_requestid.fetch_add(2, atomic::Ordering::Relaxed);
 
-                let (send, recv) =
-                    PublishNamespace::new(self.clone(), request_id, tracks.namespace.clone());
+                let (send, recv) = PublishNamespace::new(self.clone(), request_id, namespace);
                 entry.insert(recv);
                 send
             }
         };
 
-        let mut subscribe_tasks = FuturesUnordered::new();
-        let mut status_tasks = FuturesUnordered::new();
-        let mut subscribe_done = false;
-        let mut status_done = false;
-
-        loop {
-            tokio::select! {
-                res = publish_ns.subscribed(), if !subscribe_done => {
-                    match res? {
-                        Some(subscribed) => {
-                            let tracks = tracks.clone();
-
-                            subscribe_tasks.push(async move {
-                                let info = subscribed.info.clone();
-                                if let Err(err) = Self::serve_subscribe(subscribed, tracks).await {
-                                    log::warn!("failed serving subscribe: {:?}, error: {}", info, err)
-                                }
-                            });
-                        },
-                        None => subscribe_done = true,
-                    }
-
-                },
-                res = publish_ns.track_status_requested(), if !status_done => {
-                    match res? {
-                        Some(status) => {
-                            let tracks = tracks.clone();
-
-                            status_tasks.push(async move {
-                                let request_msg = status.request_msg.clone();
-                                if let Err(err) = Self::serve_track_status(status, tracks).await {
-                                    log::warn!("failed serving track status request: {:?}, error: {}", request_msg, err)
-                                }
-                            });
-                        },
-                        None => status_done = true,
-                    }
-                },
-                Some(res) = subscribe_tasks.next() => res,
-                Some(res) = status_tasks.next() => res,
-                else => return Ok(())
-            }
-        }
+        Ok(publish_ns)
     }
 
     pub async fn serve_subscribe(
@@ -196,13 +161,16 @@ impl Publisher {
         Ok(())
     }
 
-    // Returns subscriptions that do not map to an active announce.
     pub async fn subscribed(&mut self) -> Option<Subscribed> {
         self.unknown_subscribed.pop().await
     }
 
     pub async fn track_status_requested(&mut self) -> Option<TrackStatusRequested> {
         self.unknown_track_status_requested.pop().await
+    }
+
+    pub async fn subscribe_namespace_received(&mut self) -> Option<SubscribeNamespaceReceived> {
+        self.subscribe_namespace_received_queue.pop().await
     }
 
     pub async fn publish(&mut self, track: serve::TrackReader) -> Result<Published, SessionError> {
@@ -370,24 +338,18 @@ impl Publisher {
         let subscribed = {
             let mut subscribeds = self.subscribeds.lock().unwrap();
 
-            // See if entry exists for this request id already, if so error out
             let entry = match subscribeds.entry(msg.id) {
                 hash_map::Entry::Occupied(_) => return Err(SessionError::Duplicate),
                 hash_map::Entry::Vacant(entry) => entry,
             };
 
-            // Create new Subscribed entry and add to HashMap
             let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone());
             entry.insert(recv);
 
             send
         };
 
-        if let Some(publish_ns) = self.publish_namespaces.lock().unwrap().get_mut(&namespace) {
-            return publish_ns.recv_subscribe(subscribed).map_err(Into::into);
-        }
         if let Err(err) = self.unknown_subscribed.push(subscribed) {
-            // Default to closing with a not found error I guess.
             err.close(ServeError::not_found_ctx(format!(
                 "unknown_subscribed queue full for namespace {:?}",
                 namespace
@@ -406,21 +368,12 @@ impl Publisher {
     }
 
     fn recv_track_status(&mut self, msg: message::TrackStatus) -> Result<(), SessionError> {
-        let namespace = msg.track_namespace.clone();
-
-        // Create TrackStatusRequested to track this request
         let track_status_requested = TrackStatusRequested::new(self.clone(), msg);
 
-        if let Some(publish_ns) = self.publish_namespaces.lock().unwrap().get_mut(&namespace) {
-            return publish_ns
-                .recv_track_status_requested(track_status_requested)
-                .map_err(Into::into);
-        }
         if let Err(mut err) = self
             .unknown_track_status_requested
             .push(track_status_requested)
         {
-            // push only fails if the queue is dropped, send  TrackStatusError, Internal error
             err.respond_error(0, "Internal error")?;
         }
 
@@ -441,52 +394,27 @@ impl Publisher {
     ) -> Result<(), SessionError> {
         let namespace_prefix = msg.track_namespace_prefix.clone();
 
-        // remove the namespace from the filtered_namespaces
         self.filtered_namespaces
             .lock()
             .unwrap()
             .remove(&namespace_prefix);
 
-        let has = self
-            .publish_namespaces
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(n, _)| n == &namespace_prefix);
+        let mut entries = self.subscribe_namespaces_received.lock().unwrap();
 
-        if !has {
-            self.send_message(SubscribeNamespaceError {
-                id: msg.id,
-                error_code: 0x4,
-                reason_phrase: ReasonPhrase("Namespace not found".to_string()),
-            });
-        } else {
-            self.send_message(SubscribeNamespaceOk { id: msg.id });
+        let entry = match entries.entry(msg.id) {
+            hash_map::Entry::Occupied(_) => return Err(SessionError::Duplicate),
+            hash_map::Entry::Vacant(entry) => entry,
+        };
+
+        let (send, recv) =
+            SubscribeNamespaceReceived::new(self.clone(), msg.id, namespace_prefix);
+
+        if let Err(send) = self.subscribe_namespace_received_queue.push(send) {
+            send.reject(0x0, "Internal error")?;
+            return Ok(());
         }
 
-        if self
-            .subscribeds
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(_, s)| s.get_namespace() == namespace_prefix)
-        {
-            self.send_message(SubscribeNamespaceError {
-                id: msg.id,
-                error_code: 0x5,
-                reason_phrase: ReasonPhrase("Namespace already subscribed".to_string()),
-            });
-        }
-
-        // Send the publish namespace request
-        let request_id = self.next_requestid.fetch_add(2, atomic::Ordering::Relaxed);
-        self.send_message(message::PublishNamespace {
-            id: request_id,
-            track_namespace: namespace_prefix,
-            params: Default::default(),
-        });
-
-        // FIXME: we should also send the publish message
+        entry.insert(recv);
 
         Ok(())
     }
@@ -495,11 +423,27 @@ impl Publisher {
         &mut self,
         msg: message::UnsubscribeNamespace,
     ) -> Result<(), SessionError> {
-        // set the namesapce into the filtered_namespaces
         self.filtered_namespaces
             .lock()
             .unwrap()
             .insert(msg.track_namespace_prefix.clone());
+
+        let mut entries = self.subscribe_namespaces_received.lock().unwrap();
+        let to_remove: Vec<u64> = entries
+            .iter_mut()
+            .filter_map(|(id, recv)| {
+                if recv.namespace_prefix() == &msg.track_namespace_prefix {
+                    recv.recv_unsubscribe().ok();
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for id in to_remove {
+            entries.remove(&id);
+        }
 
         Ok(())
     }

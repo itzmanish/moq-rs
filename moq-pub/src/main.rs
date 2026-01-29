@@ -8,7 +8,11 @@ use tokio::io::AsyncReadExt;
 
 use moq_native_ietf::quic;
 use moq_pub::Media;
-use moq_transport::{coding::TrackNamespace, serve, session::Publisher};
+use moq_transport::{
+    coding::TrackNamespace,
+    serve::{self, TracksReader},
+    session::{Publisher, SessionError},
+};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -37,6 +41,21 @@ pub struct Cli {
     /// The TLS configuration.
     #[command(flatten)]
     pub tls: moq_native_ietf::tls::Args,
+}
+
+async fn serve_subscriptions(
+    mut publisher: Publisher,
+    tracks: TracksReader,
+) -> Result<(), SessionError> {
+    while let Some(subscribed) = publisher.subscribed().await {
+        let info = subscribed.info.clone();
+        log::info!("serving subscribe: {:?}", info);
+
+        if let Err(err) = Publisher::serve_subscribe(subscribed, tracks.clone()).await {
+            log::warn!("failed serving subscribe: {:?}, error: {}", info, err);
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -75,12 +94,16 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to create MoQ Transport publisher")?;
 
+    let publish_ns = publisher
+        .publish_namespace(reader.namespace.clone())
+        .await
+        .context("failed to register namespace")?;
+
     tokio::select! {
         res = session.run() => res.context("session error")?,
-        res = run_media(media) => {
-            res.context("media error")?
-        },
-        res = publisher.publish_namespace(reader) => res.context("publisher error")?,
+        res = run_media(media) => res.context("media error")?,
+        res = serve_subscriptions(publisher, reader) => res.context("publisher error")?,
+        res = publish_ns.closed() => res.context("namespace closed")?,
     }
 
     Ok(())

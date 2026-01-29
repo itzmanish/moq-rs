@@ -3,8 +3,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    serve::Tracks,
-    session::{PublishNamespaceReceived, SessionError, Subscriber},
+    message::{FilterType, GroupOrder},
+    serve::{ServeError, Track, Tracks},
+    session::{PublishNamespaceReceived, PublishReceived, SessionError, Subscriber},
 };
 
 use crate::{Coordinator, Locals, Producer};
@@ -33,23 +34,30 @@ impl Consumer {
         }
     }
 
-    /// Run the consumer to serve announce requests.
-    pub async fn run(mut self) -> Result<(), SessionError> {
-        let mut tasks = FuturesUnordered::new();
+    /// Run the consumer to serve announce requests and track-level publish messages.
+    pub async fn run(self) -> Result<(), SessionError> {
+        let mut tasks: FuturesUnordered<futures::future::BoxFuture<'_, ()>> =
+            FuturesUnordered::new();
 
         loop {
+            let mut subscriber_ns = self.subscriber.clone();
+            let mut subscriber_publish = self.subscriber.clone();
+
             tokio::select! {
-                Some(publish_ns) = self.subscriber.publish_ns_recvd() => {
+                Some(publish_ns) = subscriber_ns.publish_ns_recvd() => {
                     let this = self.clone();
 
                     tasks.push(async move {
                         let info = publish_ns.clone();
                         log::info!("serving publish_namespace: {:?}", info);
 
-                        if let Err(err) = this.serve(publish_ns).await {
+                        if let Err(err) = this.serve_publish_namespace(publish_ns).await {
                             log::warn!("failed serving publish_namespace: {:?}, error: {}", info, err)
                         }
-                    });
+                    }.boxed());
+                },
+                Some(publish) = subscriber_publish.publish_received() => {
+                        log::warn!("not handling publish yet: {:?}", publish.info);
                 },
                 _ = tasks.next(), if !tasks.is_empty() => {},
                 else => return Ok(()),
@@ -57,7 +65,7 @@ impl Consumer {
         }
     }
 
-    async fn serve(
+    async fn serve_publish_namespace(
         mut self,
         mut publish_ns: PublishNamespaceReceived,
     ) -> Result<(), anyhow::Error> {
@@ -81,15 +89,23 @@ impl Consumer {
 
         publish_ns.ok()?;
 
-        // Forward the announce, if needed
-        if let Some(mut forward) = self.forward {
+        if let Some(mut forward) = self.forward.clone() {
+            let reader_clone = reader.clone();
             tasks.push(
                 async move {
-                    log::info!("forwarding publish_namespace: {:?}", reader.info);
-                    forward
-                        .publish_namespace(reader)
+                    log::info!("forwarding publish_namespace: {:?}", reader_clone.info);
+                    let publish_ns = forward
+                        .publish_namespace(reader_clone)
                         .await
-                        .context("failed forwarding publish_namespace")
+                        .context("failed forwarding publish_namespace")?;
+                    publish_ns
+                        .ok()
+                        .await
+                        .context("publish_namespace not accepted")?;
+                    publish_ns
+                        .closed()
+                        .await
+                        .context("publish_namespace closed with error")
                 }
                 .boxed(),
             );

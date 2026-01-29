@@ -1,10 +1,10 @@
-use std::{collections::VecDeque, ops};
+use std::ops;
 
 use crate::coding::TrackNamespace;
 use crate::watch::State;
 use crate::{message, serve::ServeError};
 
-use super::{Publisher, Subscribed, TrackStatusRequested};
+use super::Publisher;
 
 #[derive(Debug, Clone)]
 pub struct PublishNamespaceInfo {
@@ -12,9 +12,12 @@ pub struct PublishNamespaceInfo {
     pub namespace: TrackNamespace,
 }
 
+/// Internal state for PublishNamespace.
+/// 
+/// PublishNamespace is a namespace registry that advertises to subscribers
+/// that a publisher has tracks available in a namespace. It does NOT route
+/// subscriptions - that happens via PUBLISH/SUBSCRIBE messages directly.
 struct PublishNamespaceState {
-    subscribers: VecDeque<Subscribed>,
-    track_statuses_requested: VecDeque<TrackStatusRequested>,
     ok: bool,
     closed: Result<(), ServeError>,
 }
@@ -22,22 +25,8 @@ struct PublishNamespaceState {
 impl Default for PublishNamespaceState {
     fn default() -> Self {
         Self {
-            subscribers: Default::default(),
-            track_statuses_requested: Default::default(),
             ok: false,
             closed: Ok(()),
-        }
-    }
-}
-
-impl Drop for PublishNamespaceState {
-    fn drop(&mut self) {
-        for subscriber in self.subscribers.drain(..) {
-            subscriber
-                .close(ServeError::not_found_ctx(
-                    "publish_namespace dropped before subscription handled",
-                ))
-                .ok();
         }
     }
 }
@@ -93,47 +82,6 @@ impl PublishNamespace {
                 match state.modified() {
                     Some(notified) => notified,
                     None => return Ok(()),
-                }
-            }
-            .await;
-        }
-    }
-
-    /// Wait until a subscriber is received
-    pub async fn subscribed(&self) -> Result<Option<Subscribed>, ServeError> {
-        loop {
-            {
-                let state = self.state.lock();
-                if !state.subscribers.is_empty() {
-                    return Ok(state
-                        .into_mut()
-                        .and_then(|mut state| state.subscribers.pop_front()));
-                }
-
-                state.closed.clone()?;
-                match state.modified() {
-                    Some(notified) => notified,
-                    None => return Ok(None),
-                }
-            }
-            .await;
-        }
-    }
-
-    pub async fn track_status_requested(&self) -> Result<Option<TrackStatusRequested>, ServeError> {
-        loop {
-            {
-                let state = self.state.lock();
-                if !state.track_statuses_requested.is_empty() {
-                    return Ok(state
-                        .into_mut()
-                        .and_then(|mut state| state.track_statuses_requested.pop_front()));
-                }
-
-                state.closed.clone()?;
-                match state.modified() {
-                    Some(notified) => notified,
-                    None => return Ok(None),
                 }
             }
             .await;
@@ -204,24 +152,6 @@ impl PublishNamespaceRecv {
         let mut state = state.into_mut().ok_or(ServeError::Done)?;
         state.closed = Err(err);
 
-        Ok(())
-    }
-
-    pub fn recv_subscribe(&mut self, subscriber: Subscribed) -> Result<(), ServeError> {
-        let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
-        state.subscribers.push_back(subscriber);
-
-        Ok(())
-    }
-
-    pub fn recv_track_status_requested(
-        &mut self,
-        track_status_requested: TrackStatusRequested,
-    ) -> Result<(), ServeError> {
-        let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
-        state
-            .track_statuses_requested
-            .push_back(track_status_requested);
         Ok(())
     }
 }
