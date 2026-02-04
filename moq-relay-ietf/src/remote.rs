@@ -16,7 +16,7 @@ use moq_transport::serve::{Track, TrackReader, TrackWriter};
 use moq_transport::watch::State;
 use url::Url;
 
-use crate::Coordinator;
+use crate::{metrics::GaugeGuard, Coordinator};
 
 /// Information about remote origins.
 pub struct Remotes {
@@ -228,14 +228,34 @@ impl RemoteProducer {
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        // Track upstream connection attempts - decrements when this function returns
+        let _upstream_guard = GaugeGuard::new("moq_relay_upstream_connections");
+
         let client = if let Some(client) = &self.info.client {
             client
         } else {
             &self.quic
         };
         // TODO reuse QUIC and MoQ sessions
-        let (session, _quic_client_initial_cid) = client.connect(&self.url, self.addr).await?;
-        let (session, subscriber) = moq_transport::session::Subscriber::connect(session).await?;
+        let (session, _quic_client_initial_cid) = match client.connect(&self.url, self.addr).await {
+            Ok(session) => session,
+            Err(err) => {
+                #[cfg(feature = "metrics")]
+                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
+                    .increment(1);
+                return Err(err);
+            }
+        };
+        let (session, subscriber) = match moq_transport::session::Subscriber::connect(session).await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                #[cfg(feature = "metrics")]
+                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
+                    .increment(1);
+                return Err(err.into());
+            }
+        };
 
         // Run the session
         let mut session = session.run().boxed();

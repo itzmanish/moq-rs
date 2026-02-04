@@ -4,7 +4,10 @@ use moq_transport::{
     session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
 };
 
-use crate::{Locals, RemotesConsumer};
+use crate::{
+    metrics::{GaugeGuard, TimingGuard},
+    Locals, RemotesConsumer,
+};
 
 /// Producer of tracks to a remote Subscriber
 #[derive(Clone)]
@@ -41,6 +44,9 @@ impl Producer {
             tokio::select! {
                 // Handle a new subscribe request
                 Some(subscribed) = publisher_subscribed.subscribed() => {
+                    #[cfg(feature = "metrics")]
+                    metrics::counter!("moq_relay_subscribers_total").increment(1);
+
                     let this = self.clone();
 
                     // Spawn a new task to handle the subscribe
@@ -77,6 +83,12 @@ impl Producer {
 
     /// Serve a subscribe request.
     async fn serve_subscribe(self, subscribed: Subscribed) -> Result<(), anyhow::Error> {
+        // Track subscribe latency from request to track resolution (records on drop)
+        let mut timing_guard =
+            TimingGuard::with_label("moq_relay_subscribe_latency_seconds", "source", "not_found");
+        // Track active subscriptions - decrements when this function returns
+        let _sub_guard = GaugeGuard::new("moq_relay_active_subscriptions");
+
         let namespace = subscribed.track_namespace.clone();
         let track_name = subscribed.track_name.clone();
 
@@ -85,6 +97,10 @@ impl Producer {
             // Pass the full requested namespace, not the announced prefix
             if let Some(track) = local.subscribe(namespace.clone(), &track_name) {
                 log::info!("serving subscribe from local: {:?}", track.info);
+                // Update label to indicate local source, timing recorded on drop
+                timing_guard.set_label("source", "local");
+                // Track active tracks - decrements when serve completes
+                let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
                 return Ok(subscribed.serve(track).await?);
             }
         }
@@ -96,16 +112,28 @@ impl Producer {
                     if let Some(remote) = remote {
                         if let Some(track) = remote.subscribe(&namespace, &track_name)? {
                             log::info!("serving subscribe from remote: {:?}", track.info);
+                            // Update label to indicate remote source, timing recorded on drop
+                            timing_guard.set_label("source", "remote");
+                            // Track active tracks - decrements when serve completes
+                            let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
                             return Ok(subscribed.serve(track.reader).await?);
                         }
                     }
                 }
                 Err(e) => {
                     log::error!("failed to route to remote: {}", e);
+                    #[cfg(feature = "metrics")]
+                    metrics::counter!("moq_relay_subscribe_failures_total", "reason" => "route_error")
+                        .increment(1);
                 }
             }
         }
         // Track not found - close the subscription with not found error
+        // timing_guard label already set to "not_found", will record on drop
+        #[cfg(feature = "metrics")]
+        metrics::counter!("moq_relay_subscribe_failures_total", "reason" => "not_found")
+            .increment(1);
+
         let err = ServeError::not_found_ctx(format!(
             "track '{}/{}' not found in local or remote tracks",
             namespace, track_name
