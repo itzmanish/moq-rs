@@ -34,10 +34,10 @@ impl PublishReceivedInfo {
     }
 }
 
-#[derive(Debug)]
 struct PublishReceivedState {
     ok: bool,
     closed: Result<(), ServeError>,
+    writer: Option<serve::TrackWriter>,
 }
 
 impl Default for PublishReceivedState {
@@ -45,6 +45,7 @@ impl Default for PublishReceivedState {
         Self {
             ok: false,
             closed: Ok(()),
+            writer: None,
         }
     }
 }
@@ -75,7 +76,7 @@ impl PublishReceived {
         
         let recv = PublishReceivedRecv {
             state: recv,
-            writer: None,
+            writer_mode: None,
         };
         
         (send, recv)
@@ -83,7 +84,7 @@ impl PublishReceived {
 
     pub fn accept(
         mut self,
-        _track: serve::TrackWriter,
+        track: serve::TrackWriter,
         forward: bool,
         subscriber_priority: u8,
         group_order: message::GroupOrder,
@@ -110,6 +111,7 @@ impl PublishReceived {
         
         if let Some(mut state) = state.into_mut() {
             state.ok = true;
+            state.writer = Some(track);
         }
         
         self.ok = true;
@@ -197,7 +199,7 @@ impl Drop for PublishReceived {
 
 pub(super) struct PublishReceivedRecv {
     state: State<PublishReceivedState>,
-    writer: Option<serve::TrackWriterMode>,
+    writer_mode: Option<serve::TrackWriterMode>,
 }
 
 impl PublishReceivedRecv {
@@ -216,29 +218,25 @@ impl PublishReceivedRecv {
         Ok(())
     }
 
-    pub fn error(mut self, err: ServeError) -> Result<(), ServeError> {
-        if let Some(writer) = self.writer.take() {
-            writer.close(err.clone())?;
+    fn take_writer(&mut self) -> Result<serve::TrackWriterMode, ServeError> {
+        if let Some(writer) = self.writer_mode.take() {
+            return Ok(writer);
         }
-        
-        let state = self.state.lock();
-        state.closed.clone()?;
-        
-        let mut state = state.into_mut().ok_or(ServeError::Cancel)?;
-        state.closed = Err(err);
-        
-        Ok(())
+
+        let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
+        let writer = state.writer.take().ok_or(ServeError::Done)?;
+        Ok(writer.into())
     }
 
-    pub fn set_writer(&mut self, track: serve::TrackWriter) {
-        self.writer = Some(track.into());
+    fn put_writer(&mut self, writer: serve::TrackWriterMode) {
+        self.writer_mode = Some(writer);
     }
 
     pub fn subgroup(
         &mut self,
         header: data::SubgroupHeader,
     ) -> Result<serve::SubgroupWriter, ServeError> {
-        let writer = self.writer.take().ok_or(ServeError::Done)?;
+        let writer = self.take_writer()?;
         
         let mut subgroups = match writer {
             serve::TrackWriterMode::Track(track) => track.subgroups()?,
@@ -252,13 +250,13 @@ impl PublishReceivedRecv {
             priority: header.publisher_priority,
         })?;
         
-        self.writer = Some(subgroups.into());
+        self.put_writer(subgroups.into());
         
         Ok(writer)
     }
 
     pub fn datagram(&mut self, datagram: data::Datagram) -> Result<(), ServeError> {
-        let writer = self.writer.take().ok_or(ServeError::Done)?;
+        let writer = self.take_writer()?;
         
         match writer {
             serve::TrackWriterMode::Track(track) => {
@@ -270,7 +268,7 @@ impl PublishReceivedRecv {
                     payload: datagram.payload.unwrap_or_default(),
                     extension_headers: datagram.extension_headers.unwrap_or_default(),
                 })?;
-                self.writer = Some(serve::TrackWriterMode::Datagrams(datagrams));
+                self.put_writer(serve::TrackWriterMode::Datagrams(datagrams));
                 Ok(())
             }
             serve::TrackWriterMode::Datagrams(mut datagrams) => {
@@ -281,11 +279,11 @@ impl PublishReceivedRecv {
                     payload: datagram.payload.unwrap_or_default(),
                     extension_headers: datagram.extension_headers.unwrap_or_default(),
                 })?;
-                self.writer = Some(serve::TrackWriterMode::Datagrams(datagrams));
+                self.put_writer(serve::TrackWriterMode::Datagrams(datagrams));
                 Ok(())
             }
             other => {
-                self.writer = Some(other);
+                self.put_writer(other);
                 Err(ServeError::Mode)
             }
         }

@@ -95,22 +95,42 @@ impl Producer {
         }
     }
 
-    /// Serve a subscribe request.
     async fn serve_subscribe(self, subscribed: Subscribed) -> Result<(), anyhow::Error> {
         let namespace = subscribed.track_namespace.clone();
         let track_name = subscribed.track_name.clone();
 
-        // Check local tracks first, and serve from local if possible
-        if let Some(mut local) = self.locals.retrieve(&namespace) {
-            // Pass the full requested namespace, not the announced prefix
-            if let Some(track) = local.subscribe(namespace.clone(), &track_name) {
-                log::info!("serving subscribe from local: {:?}", track.info);
-                return Ok(subscribed.serve(track).await?);
+        if let Some(track_info) = self
+            .locals
+            .get_or_create_track_info(&namespace, &track_name)
+        {
+            if track_info.should_subscribe_upstream() {
+                log::info!(
+                    "subscribe needs upstream request: {}/{}",
+                    namespace,
+                    track_name
+                );
+
+                if let Some(reader) = self.locals.subscribe_upstream(track_info.clone()) {
+                    log::info!(
+                        "forwarding subscribe upstream via TrackInfo: {}/{}",
+                        namespace,
+                        track_name
+                    );
+                    return Ok(subscribed.serve(reader).await?);
+                }
             }
+
+            let reader = track_info.get_reader();
+            log::info!(
+                "serving subscribe from local: {}/{} (state: {:?})",
+                namespace,
+                track_name,
+                track_info.state()
+            );
+            return Ok(subscribed.serve(reader).await?);
         }
 
         if let Some(remotes) = self.remotes {
-            // Check remote tracks second, and serve from remote if possible
             match remotes.route(&namespace).await {
                 Ok(remote) => {
                     if let Some(remote) = remote {
@@ -125,7 +145,7 @@ impl Producer {
                 }
             }
         }
-        // Track not found - close the subscription with not found error
+
         let err = ServeError::not_found_ctx(format!(
             "track '{}/{}' not found in local or remote tracks",
             namespace, track_name

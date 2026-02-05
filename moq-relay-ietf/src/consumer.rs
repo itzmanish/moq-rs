@@ -4,7 +4,7 @@ use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
     message::{FilterType, GroupOrder},
-    serve::{ServeError, Track, Tracks},
+    serve::{ServeError, Tracks},
     session::{PublishNamespaceReceived, PublishReceived, SessionError, Subscriber},
 };
 
@@ -57,7 +57,16 @@ impl Consumer {
                     }.boxed());
                 },
                 Some(publish) = subscriber_publish.publish_received() => {
-                        log::warn!("not handling publish yet: {:?}", publish.info);
+                    let this = self.clone();
+
+                    tasks.push(async move {
+                        let info = publish.info.clone();
+                        log::info!("serving publish (track-level): {:?}", info);
+
+                        if let Err(err) = this.serve_publish(publish).await {
+                            log::warn!("failed serving publish: {:?}, error: {}", info, err)
+                        }
+                    }.boxed());
                 },
                 _ = tasks.next(), if !tasks.is_empty() => {},
                 else => return Ok(()),
@@ -71,7 +80,7 @@ impl Consumer {
     ) -> Result<(), anyhow::Error> {
         let mut tasks = FuturesUnordered::new();
 
-        let (_, mut request, reader) = Tracks::new(publish_ns.namespace.clone()).produce();
+        let (writer, mut request, reader) = Tracks::new(publish_ns.namespace.clone()).produce();
 
         // NOTE(mpandit): once the track is pulled from origin, internally it will be relayed
         // from this metal only, because now coordinator will have entry for the namespace.
@@ -85,7 +94,7 @@ impl Consumer {
             .await?;
 
         // Register the local tracks, unregister on drop
-        let _register = self.locals.register(reader.clone()).await?;
+        let _register = self.locals.register(reader.clone(), writer).await?;
 
         publish_ns.ok()?;
 
@@ -137,5 +146,77 @@ impl Consumer {
                 else => return Ok(()),
             }
         }
+    }
+
+    async fn serve_publish(self, publish: PublishReceived) -> Result<(), anyhow::Error> {
+        let namespace = publish.info.track_namespace.clone();
+        let track_name = publish.info.track_name.clone();
+
+        log::info!("received PUBLISH for track: {}/{}", namespace, track_name);
+
+        let track_info = match self
+            .locals
+            .get_or_create_track_info(&namespace, &track_name)
+        {
+            Some(info) => info,
+            None => {
+                log::warn!(
+                    "PUBLISH rejected: no PUBLISH_NAMESPACE registered for namespace {}",
+                    namespace
+                );
+                publish.reject(0x4, "Namespace not announced via PUBLISH_NAMESPACE")?;
+                return Err(ServeError::NotFound.into());
+            }
+        };
+
+        let writer = match track_info.publish_arrived() {
+            Ok(w) => w,
+            Err(ServeError::Uninterested) => {
+                log::info!(
+                    "PUBLISH rejected: already subscribed to {}/{}",
+                    namespace,
+                    track_name
+                );
+                publish.reject(ServeError::Uninterested.code(), "Already subscribed")?;
+                return Err(ServeError::Uninterested.into());
+            }
+            Err(ServeError::Duplicate) => {
+                log::info!(
+                    "PUBLISH rejected: already publishing {}/{}",
+                    namespace,
+                    track_name
+                );
+                publish.reject(ServeError::Duplicate.code(), "Already publishing")?;
+                return Err(ServeError::Duplicate.into());
+            }
+            Err(e) => {
+                publish.reject(e.code(), &e.to_string())?;
+                return Err(e.into());
+            }
+        };
+
+        let reader = track_info.get_reader();
+
+        self.locals
+            .insert_track(&namespace, reader)
+            .context("failed to insert track into namespace")?;
+
+        publish.accept(
+            writer,
+            true,
+            127,
+            GroupOrder::Publisher,
+            FilterType::LargestObject,
+            None,
+            None,
+        )?;
+
+        log::info!(
+            "PUBLISH accepted, track {}/{} now in Publishing state",
+            namespace,
+            track_name
+        );
+
+        Ok(())
     }
 }

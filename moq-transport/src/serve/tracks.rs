@@ -91,6 +91,21 @@ impl TracksWriter {
         };
         self.state.lock_mut()?.tracks.remove(&full_name)
     }
+
+    /// Insert an existing track reader into the broadcast.
+    /// Returns None if all readers have been dropped or if a track with this name already exists.
+    pub fn insert(&mut self, reader: TrackReader) -> Option<()> {
+        let full_name = FullTrackName {
+            namespace: reader.namespace.clone(),
+            name: reader.name.clone(),
+        };
+        let mut state = self.state.lock_mut()?;
+        if state.tracks.contains_key(&full_name) {
+            return None;
+        }
+        state.tracks.insert(full_name, reader);
+        Some(())
+    }
 }
 
 impl Deref for TracksWriter {
@@ -212,6 +227,13 @@ impl TracksReader {
             .insert(full_name, track_writer_reader.1.clone());
 
         Some(track_writer_reader.1.clone())
+    }
+
+    /// Forward an existing track writer to the upstream subscription queue.
+    /// The writer will be received by [TracksRequest::next()].
+    /// Returns None if the queue is closed.
+    pub fn forward_upstream(&mut self, writer: TrackWriter) -> Option<()> {
+        self.queue.push(writer).ok()
     }
 }
 

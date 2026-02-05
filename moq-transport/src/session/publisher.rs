@@ -406,8 +406,7 @@ impl Publisher {
             hash_map::Entry::Vacant(entry) => entry,
         };
 
-        let (send, recv) =
-            SubscribeNamespaceReceived::new(self.clone(), msg.id, namespace_prefix);
+        let (send, recv) = SubscribeNamespaceReceived::new(self.clone(), msg.id, namespace_prefix);
 
         if let Err(send) = self.subscribe_namespace_received_queue.push(send) {
             send.reject(0x0, "Internal error")?;
