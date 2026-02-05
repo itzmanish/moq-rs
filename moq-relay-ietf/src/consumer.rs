@@ -47,11 +47,12 @@ impl Consumer {
 
                     tasks.push(async move {
                         let info = announce.clone();
-                        tracing::info!("serving announce: {:?}", info);
+                        let namespace = info.namespace.to_utf8_path();
+                        tracing::info!(namespace = %namespace, "serving announce: {:?}", info);
 
                         // Serve the announce request
                         if let Err(err) = this.serve(announce).await {
-                            tracing::warn!("failed serving announce: {:?}, error: {}", info, err);
+                            tracing::warn!(namespace = %namespace, error = %err, "failed serving announce: {:?}, error: {}", info, err);
                             // Note: phase-specific error counters are incremented in serve()
                         }
                     });
@@ -114,7 +115,8 @@ impl Consumer {
         if let Some(mut forward) = self.forward {
             tasks.push(
                 async move {
-                    tracing::info!("forwarding announce: {:?}", reader.info);
+                    let namespace = reader.namespace.to_utf8_path();
+                    tracing::info!(namespace = %namespace, "forwarding announce: {:?}", reader.info);
                     forward
                         .announce(reader)
                         .await
@@ -137,11 +139,13 @@ impl Consumer {
                     // Spawn a new task to handle the subscribe
                     tasks.push(async move {
                         let info = track.clone();
-                        tracing::info!("forwarding subscribe: {:?}", info);
+                        let namespace = info.namespace.to_utf8_path();
+                        let track_name = info.name.clone();
+                        tracing::info!(namespace = %namespace, track = %track_name, "forwarding subscribe: {:?}", info);
 
                         // Forward the subscribe request
                         if let Err(err) = subscriber.subscribe(track).await {
-                            tracing::warn!("failed forwarding subscribe: {:?}, error: {}", info, err)
+                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed forwarding subscribe: {:?}, error: {}", info, err)
                         }
 
                         Ok(())

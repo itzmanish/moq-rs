@@ -232,7 +232,7 @@ impl Relay {
                         let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path).await {
                             Ok(session) => session,
                             Err(err) => {
-                                tracing::warn!("failed to accept MoQ session: {}", err);
+                                tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);
                                 metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_accept").increment(1);
                                 // Maintain invariant: connections_total - connections_closed_total == active_connections
                                 metrics::counter!("moq_relay_connections_closed_total").increment(1);
@@ -260,7 +260,7 @@ impl Relay {
                             }
                             Err(err) => {
                                 // Actual error - protocol violation, timeout, etc.
-                                tracing::warn!("MoQ session error: {}", err);
+                                tracing::warn!(error = %err, "MoQ session error: {}", err);
                                 metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_run").increment(1);
                                 metrics::counter!("moq_relay_connections_closed_total").increment(1);
                             }
