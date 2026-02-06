@@ -12,6 +12,7 @@
 //! | Name | Labels | Description |
 //! |------|--------|-------------|
 //! | `moq_relay_connections_total` | - | Total incoming connections accepted |
+//! | `moq_relay_connections_closed_total` | - | Total connections that have closed (graceful or error) |
 //! | `moq_relay_connection_errors_total` | `stage` | Connection failures (stage: session_accept, session_run) |
 //! | `moq_relay_publishers_total` | - | Total publishers (ANNOUNCE requests) received |
 //! | `moq_relay_announce_ok_total` | - | Successful ANNOUNCE_OK responses sent |
