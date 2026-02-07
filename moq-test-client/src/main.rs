@@ -159,6 +159,11 @@ fn print_tap_result(test_number: usize, result: &TestResult, _verbose: bool) {
     let status = if result.passed { "ok" } else { "not ok" };
     let name = result.test_case.name();
     println!("{} {} - {}", status, test_number, name);
+
+    // YAML diagnostic block
+    println!("  ---");
+    println!("  duration_ms: {}", result.duration.as_millis());
+    println!("  ...");
 }
 
 #[tokio::main]
