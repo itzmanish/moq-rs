@@ -163,6 +163,30 @@ fn print_tap_result(test_number: usize, result: &TestResult, _verbose: bool) {
     // YAML diagnostic block
     println!("  ---");
     println!("  duration_ms: {}", result.duration.as_millis());
+
+    // Connection IDs for mlog correlation
+    match result.cids.len() {
+        0 => {}
+        1 => println!("  connection_id: {}", result.cids[0]),
+        2 => {
+            // Multi-connection tests: first is publisher, second is subscriber
+            // (except subscribe-before-announce where subscriber connects first)
+            if result.test_case == TestCase::SubscribeBeforeAnnounce {
+                println!("  subscriber_connection_id: {}", result.cids[0]);
+                println!("  publisher_connection_id: {}", result.cids[1]);
+            } else {
+                println!("  publisher_connection_id: {}", result.cids[0]);
+                println!("  subscriber_connection_id: {}", result.cids[1]);
+            }
+        }
+        _ => {
+            // More than 2 CIDs - just list them all
+            for (i, cid) in result.cids.iter().enumerate() {
+                println!("  connection_id_{}: {}", i + 1, cid);
+            }
+        }
+    }
+
     println!("  ...");
 }
 
