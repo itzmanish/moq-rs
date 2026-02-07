@@ -235,8 +235,10 @@ async fn main() -> Result<()> {
         None => TestCase::all(),
     };
 
-    // TAP version 14 header
+    // TAP version 14 header with run-level comments
     println!("TAP version 14");
+    println!("# moq-test-client v{}", env!("CARGO_PKG_VERSION"));
+    println!("# Relay: {}", args.relay);
     println!("1..{}", tests_to_run.len());
 
     let mut failed = 0;
