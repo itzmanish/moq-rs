@@ -155,7 +155,7 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
     }
 }
 
-fn print_tap_result(test_number: usize, result: &TestResult, _verbose: bool) {
+fn print_tap_result(test_number: usize, result: &TestResult, verbose: bool) {
     let status = if result.passed { "ok" } else { "not ok" };
     let name = result.test_case.name();
     println!("{} {} - {}", status, test_number, name);
@@ -185,6 +185,24 @@ fn print_tap_result(test_number: usize, result: &TestResult, _verbose: bool) {
                 println!("  connection_id_{}: {}", i + 1, cid);
             }
         }
+    }
+
+    // Error message for failed tests
+    if let Some(ref msg) = result.message {
+        // Escape quotes and newlines for YAML string
+        let escaped = if verbose {
+            msg.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+        } else {
+            // Non-verbose: just first line
+            msg.lines()
+                .next()
+                .unwrap_or(msg)
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+        };
+        println!("  message: \"{}\"", escaped);
     }
 
     println!("  ...");
