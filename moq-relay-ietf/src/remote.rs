@@ -228,9 +228,6 @@ impl RemoteProducer {
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        // Track upstream connection attempts - decrements when this function returns
-        let _upstream_guard = GaugeGuard::new("moq_relay_upstream_connections");
-
         let client = if let Some(client) = &self.info.client {
             client
         } else {
@@ -254,6 +251,11 @@ impl RemoteProducer {
                 return Err(err.into());
             }
         };
+
+        // Track established upstream connections - decrements when this function returns.
+        // Placed after successful connect + session setup so the gauge only reflects
+        // connections that are actually serving, not in-flight attempts.
+        let _upstream_guard = GaugeGuard::new("moq_relay_upstream_connections");
 
         // Run the session
         let mut session = session.run().boxed();
