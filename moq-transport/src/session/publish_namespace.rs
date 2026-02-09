@@ -13,7 +13,7 @@ pub struct PublishNamespaceInfo {
 }
 
 /// Internal state for PublishNamespace.
-/// 
+///
 /// PublishNamespace is a namespace registry that advertises to subscribers
 /// that a publisher has tracks available in a namespace. It does NOT route
 /// subscriptions - that happens via PUBLISH/SUBSCRIBE messages directly.
@@ -155,5 +155,3 @@ impl PublishNamespaceRecv {
         Ok(())
     }
 }
-
-

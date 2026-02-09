@@ -105,10 +105,9 @@ impl Drop for SubscribeNs {
             return;
         }
 
-        self.subscriber
-            .send_message(message::UnsubscribeNamespace {
-                track_namespace_prefix: self.namespace_prefix.clone(),
-            });
+        self.subscriber.send_message(message::UnsubscribeNamespace {
+            track_namespace_prefix: self.namespace_prefix.clone(),
+        });
     }
 }
 

@@ -399,9 +399,6 @@ pub async fn test_subscribe_before_announce(args: &Args) -> Result<TestConnectio
             .await
             .context("publisher SETUP failed")?;
 
-        let (mut pub_writer, _, pub_reader) = Tracks::new(namespace.clone()).produce();
-        let _track_writer = pub_writer.create(TEST_TRACK);
-
         log::info!(
             "Publisher announcing namespace (after subscriber): {}",
             TEST_NAMESPACE

@@ -3,7 +3,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    message::{FilterType, GroupOrder},
+    coding::KeyValuePairs,
+    message::{FilterType, GroupOrder, PublishOk},
     serve::{ServeError, Tracks},
     session::{PublishNamespaceReceived, PublishReceived, SessionError, Subscriber},
 };
@@ -201,15 +202,18 @@ impl Consumer {
             .insert_track(&namespace, reader)
             .context("failed to insert track into namespace")?;
 
-        publish.accept(
-            writer,
-            true,
-            127,
-            GroupOrder::Publisher,
-            FilterType::LargestObject,
-            None,
-            None,
-        )?;
+        let msg = PublishOk {
+            id: publish.info.id,
+            forward: true,
+            subscriber_priority: 127,
+            group_order: GroupOrder::Publisher,
+            filter_type: FilterType::LargestObject,
+            start_location: None,
+            end_group_id: None,
+            params: KeyValuePairs::default(),
+        };
+
+        publish.accept(writer, msg)?;
 
         log::info!(
             "PUBLISH accepted, track {}/{} now in Publishing state",

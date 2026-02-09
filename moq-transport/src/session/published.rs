@@ -98,11 +98,11 @@ impl Published {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> (Self, PublishedRecv) {
         let info = PublishInfo::new_from_publish(&msg);
-        
+
         publisher.send_message(msg);
-        
+
         let (send, recv) = State::default().split();
-        
+
         let send = Self {
             publisher,
             info,
@@ -110,11 +110,9 @@ impl Published {
             ok: false,
             mlog,
         };
-        
-        let recv = PublishedRecv {
-            state: recv,
-        };
-        
+
+        let recv = PublishedRecv { state: recv };
+
         (send, recv)
     }
 
@@ -127,7 +125,7 @@ impl Published {
                     return Ok(());
                 }
                 state.closed.clone()?;
-                
+
                 match state.modified() {
                     Some(notified) => notified,
                     None => return Ok(()),
@@ -142,7 +140,7 @@ impl Published {
             {
                 let state = self.state.lock();
                 state.closed.clone()?;
-                
+
                 match state.modified() {
                     Some(notify) => notify,
                     None => return Ok(()),
@@ -155,10 +153,10 @@ impl Published {
     pub fn close(self, err: ServeError) -> Result<(), ServeError> {
         let state = self.state.lock();
         state.closed.clone()?;
-        
+
         let mut state = state.into_mut().ok_or(ServeError::Done)?;
         state.closed = Err(err);
-        
+
         Ok(())
     }
 
@@ -172,17 +170,17 @@ impl Published {
 
     async fn serve_inner(&mut self, track: serve::TrackReader) -> Result<(), SessionError> {
         self.ok().await?;
-        
+
         let forward = {
             let state = self.state.lock();
             state.forward
         };
-        
+
         if !forward {
             self.closed().await?;
             return Ok(());
         }
-        
+
         match track.mode().await? {
             TrackReaderMode::Stream(_stream) => panic!("deprecated"),
             TrackReaderMode::Subgroups(subgroups) => self.serve_subgroups(subgroups).await,
@@ -196,7 +194,7 @@ impl Published {
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
         let mut done: Option<Result<(), ServeError>> = None;
-        
+
         loop {
             tokio::select! {
                 res = subgroups.next(), if done.is_none() => match res {
@@ -208,12 +206,12 @@ impl Published {
                             subgroup_id: Some(subgroup.subgroup_id),
                             publisher_priority: subgroup.priority,
                         };
-                        
+
                         let publisher = self.publisher.clone();
                         let state = self.state.clone();
                         let info = subgroup.info.clone();
                         let mlog = self.mlog.clone();
-                        
+
                         tasks.push(async move {
                             if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog).await {
                                 log::warn!("failed to serve subgroup: {:?}, error: {}", info, err);
@@ -243,12 +241,12 @@ impl Published {
             subgroup_reader.subgroup_id,
             subgroup_reader.priority
         );
-        
+
         let mut send_stream = publisher.open_uni().await?;
         send_stream.set_priority(subgroup_reader.priority as i32);
-        
+
         let mut writer = Writer::new(send_stream);
-        
+
         log::debug!(
             "[PUBLISHED] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
             header.track_alias,
@@ -257,9 +255,9 @@ impl Published {
             header.publisher_priority,
             header.header_type
         );
-        
+
         writer.encode(&header).await?;
-        
+
         if let Some(ref mlog) = mlog {
             if let Ok(mut mlog_guard) = mlog.lock() {
                 let time = mlog_guard.elapsed_ms();
@@ -268,7 +266,7 @@ impl Published {
                 let _ = mlog_guard.add_event(event);
             }
         }
-        
+
         let mut object_count = 0;
         while let Some(mut subgroup_object_reader) = subgroup_reader.next().await? {
             let subgroup_object = data::SubgroupObjectExt {
@@ -281,7 +279,7 @@ impl Published {
                     None
                 },
             };
-            
+
             log::debug!(
                 "[PUBLISHED] serve_subgroup: sending object #{} - object_id={}, object_id_delta={}, payload_length={}, status={:?}",
                 object_count + 1,
@@ -290,9 +288,9 @@ impl Published {
                 subgroup_object.payload_length,
                 subgroup_object.status
             );
-            
+
             writer.encode(&subgroup_object).await?;
-            
+
             if let Some(ref mlog) = mlog {
                 if let Ok(mut mlog_guard) = mlog.lock() {
                     let time = mlog_guard.elapsed_ms();
@@ -308,7 +306,7 @@ impl Published {
                     let _ = mlog_guard.add_event(event);
                 }
             }
-            
+
             state
                 .lock_mut()
                 .ok_or(ServeError::Done)?
@@ -316,21 +314,21 @@ impl Published {
                     subgroup_reader.group_id,
                     subgroup_object_reader.object_id,
                 )?;
-            
+
             while let Some(chunk) = subgroup_object_reader.read().await? {
                 writer.write(&chunk).await?;
             }
-            
+
             object_count += 1;
         }
-        
+
         log::info!(
             "[PUBLISHED] serve_subgroup: completed subgroup (group_id={}, subgroup_id={:?}, {} objects sent)",
             subgroup_reader.group_id,
             subgroup_reader.subgroup_id,
             object_count
         );
-        
+
         Ok(())
     }
 
@@ -339,7 +337,7 @@ impl Published {
         mut datagrams: serve::DatagramsReader,
     ) -> Result<(), SessionError> {
         log::debug!("[PUBLISHED] serve_datagrams: starting");
-        
+
         let mut datagram_count = 0;
         while let Some(datagram) = datagrams.read().await? {
             let has_extension_headers = !datagram.extension_headers.is_empty();
@@ -348,7 +346,7 @@ impl Published {
             } else {
                 data::DatagramType::ObjectIdPayload
             };
-            
+
             let encoded_datagram = data::Datagram {
                 datagram_type,
                 track_alias: self.info.track_alias,
@@ -363,7 +361,7 @@ impl Published {
                 status: None,
                 payload: Some(datagram.payload),
             };
-            
+
             let payload_len = encoded_datagram
                 .payload
                 .as_ref()
@@ -371,7 +369,7 @@ impl Published {
                 .unwrap_or(0);
             let mut buffer = bytes::BytesMut::with_capacity(payload_len + 100);
             encoded_datagram.encode(&mut buffer)?;
-            
+
             log::debug!(
                 "[PUBLISHED] serve_datagrams: sending datagram #{} - track_alias={}, group_id={}, object_id={}, priority={}, payload_len={}",
                 datagram_count + 1,
@@ -381,7 +379,7 @@ impl Published {
                 encoded_datagram.publisher_priority,
                 payload_len
             );
-            
+
             if let Some(ref mlog) = self.mlog {
                 if let Ok(mut mlog_guard) = mlog.lock() {
                     let time = mlog_guard.elapsed_ms();
@@ -393,9 +391,9 @@ impl Published {
                     ));
                 }
             }
-            
+
             self.publisher.send_datagram(buffer.into()).await?;
-            
+
             self.state
                 .lock_mut()
                 .ok_or(ServeError::Done)?
@@ -403,22 +401,22 @@ impl Published {
                     encoded_datagram.group_id,
                     encoded_datagram.object_id.unwrap(),
                 )?;
-            
+
             datagram_count += 1;
         }
-        
+
         log::info!(
             "[PUBLISHED] serve_datagrams: completed ({} datagrams sent)",
             datagram_count
         );
-        
+
         Ok(())
     }
 }
 
 impl ops::Deref for Published {
     type Target = PublishInfo;
-    
+
     fn deref(&self) -> &Self::Target {
         &self.info
     }
@@ -434,7 +432,7 @@ impl Drop for Published {
             .cloned()
             .unwrap_or(ServeError::Done);
         drop(state);
-        
+
         self.publisher.send_message(message::PublishDone {
             id: self.info.id,
             status_code: err.code(),
@@ -454,7 +452,7 @@ impl PublishedRecv {
         if state.ok {
             return Err(ServeError::Duplicate);
         }
-        
+
         if let Some(mut state) = state.into_mut() {
             state.ok = true;
             state.forward = msg.forward;
@@ -464,17 +462,17 @@ impl PublishedRecv {
             state.start_location = msg.start_location;
             state.end_group_id = msg.end_group_id;
         }
-        
+
         Ok(())
     }
-    
+
     pub fn recv_error(self, err: ServeError) -> Result<(), ServeError> {
         let state = self.state.lock();
         state.closed.clone()?;
-        
+
         let mut state = state.into_mut().ok_or(ServeError::Done)?;
         state.closed = Err(err);
-        
+
         Ok(())
     }
 }
