@@ -4,8 +4,8 @@ use std::{
 };
 
 use crate::{
-    coding::TrackNamespace,
-    message::{self, GroupOrder, Message},
+    coding::{KeyValuePairs, TrackNamespace},
+    message::{self, GroupOrder, Message, ParameterType},
     mlog,
     serve::{self, ServeError, TracksReader},
 };
@@ -184,19 +184,22 @@ impl Publisher {
             .next_track_alias
             .fetch_add(1, atomic::Ordering::Relaxed);
 
-        let largest_location = track.largest_location();
-        let content_exists = largest_location.is_some();
+        let mut params = KeyValuePairs::new();
+        params.set_intvalue(ParameterType::GroupOrder.into(), GroupOrder::Ascending as u64);
+        params.set_intvalue(ParameterType::Forward.into(), 1);
+        if let Some(loc) = track.largest_location() {
+            let mut buf = bytes::BytesMut::new();
+            use crate::coding::Encode;
+            loc.encode(&mut buf).ok();
+            params.set_bytesvalue(ParameterType::LargestObject.into(), buf.to_vec());
+        }
 
         let msg = message::Publish {
             id: request_id,
             track_namespace: track.namespace.clone(),
             track_name: track.name.clone(),
             track_alias,
-            group_order: GroupOrder::Ascending,
-            content_exists,
-            largest_location,
-            forward: true,
-            params: Default::default(),
+            params,
             track_extensions: Default::default(),
         };
 
@@ -218,19 +221,22 @@ impl Publisher {
             .next_track_alias
             .fetch_add(1, atomic::Ordering::Relaxed);
 
-        let largest_location = track.largest_location();
-        let content_exists = largest_location.is_some();
+        let mut params = KeyValuePairs::new();
+        params.set_intvalue(ParameterType::GroupOrder.into(), group_order as u64);
+        params.set_intvalue(ParameterType::Forward.into(), if forward { 1 } else { 0 });
+        if let Some(loc) = track.largest_location() {
+            let mut buf = bytes::BytesMut::new();
+            use crate::coding::Encode;
+            loc.encode(&mut buf).ok();
+            params.set_bytesvalue(ParameterType::LargestObject.into(), buf.to_vec());
+        }
 
         let msg = message::Publish {
             id: request_id,
             track_namespace: track.namespace.clone(),
             track_name: track.name.clone(),
             track_alias,
-            group_order,
-            content_exists,
-            largest_location,
-            forward,
-            params: Default::default(),
+            params,
             track_extensions: Default::default(),
         };
 

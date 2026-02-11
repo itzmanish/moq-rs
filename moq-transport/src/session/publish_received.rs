@@ -1,6 +1,6 @@
 use std::ops;
 
-use crate::coding::{Location, ReasonPhrase, TrackNamespace};
+use crate::coding::{ReasonPhrase, TrackNamespace};
 use crate::serve::ServeError;
 use crate::watch::State;
 use crate::{data, message, serve};
@@ -13,10 +13,6 @@ pub struct PublishReceivedInfo {
     pub track_namespace: TrackNamespace,
     pub track_name: String,
     pub track_alias: u64,
-    pub group_order: message::GroupOrder,
-    pub content_exists: bool,
-    pub largest_location: Option<Location>,
-    pub forward: bool,
 }
 
 impl PublishReceivedInfo {
@@ -26,10 +22,6 @@ impl PublishReceivedInfo {
             track_namespace: msg.track_namespace.clone(),
             track_name: msg.track_name.clone(),
             track_alias: msg.track_alias,
-            group_order: msg.group_order,
-            content_exists: msg.content_exists,
-            largest_location: msg.largest_location,
-            forward: msg.forward,
         }
     }
 }

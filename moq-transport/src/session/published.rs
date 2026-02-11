@@ -5,6 +5,7 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
 use crate::coding::{Encode, Location, ReasonPhrase, TrackNamespace};
+use crate::message::ParameterType;
 use crate::mlog;
 use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
@@ -18,10 +19,6 @@ pub struct PublishInfo {
     pub track_namespace: TrackNamespace,
     pub track_name: String,
     pub track_alias: u64,
-    pub group_order: message::GroupOrder,
-    pub content_exists: bool,
-    pub largest_location: Option<Location>,
-    pub forward: bool,
 }
 
 impl PublishInfo {
@@ -31,10 +28,6 @@ impl PublishInfo {
             track_namespace: msg.track_namespace.clone(),
             track_name: msg.track_name.clone(),
             track_alias: msg.track_alias,
-            group_order: msg.group_order,
-            content_exists: msg.content_exists,
-            largest_location: msg.largest_location,
-            forward: msg.forward,
         }
     }
 }
@@ -45,9 +38,6 @@ struct PublishedState {
     forward: bool,
     subscriber_priority: u8,
     group_order: message::GroupOrder,
-    filter_type: message::FilterType,
-    start_location: Option<Location>,
-    end_group_id: Option<u64>,
     largest_location: Option<Location>,
     closed: Result<(), ServeError>,
 }
@@ -71,11 +61,8 @@ impl Default for PublishedState {
         Self {
             ok: false,
             forward: false,
-            subscriber_priority: 127,
+            subscriber_priority: 128,
             group_order: message::GroupOrder::Ascending,
-            filter_type: message::FilterType::LargestObject,
-            start_location: None,
-            end_group_id: None,
             largest_location: None,
             closed: Ok(()),
         }
@@ -455,12 +442,22 @@ impl PublishedRecv {
 
         if let Some(mut state) = state.into_mut() {
             state.ok = true;
-            state.forward = msg.forward;
-            state.subscriber_priority = msg.subscriber_priority;
-            state.group_order = msg.group_order;
-            state.filter_type = msg.filter_type;
-            state.start_location = msg.start_location;
-            state.end_group_id = msg.end_group_id;
+
+            // Extract subscription properties from parameters (draft-16)
+            if let Some(v) = msg.params.get_intvalue(ParameterType::Forward.into()) {
+                state.forward = v == 1;
+            }
+            if let Some(v) = msg.params.get_intvalue(ParameterType::SubscriberPriority.into()) {
+                state.subscriber_priority = v as u8;
+            }
+            if let Some(v) = msg.params.get_intvalue(ParameterType::GroupOrder.into()) {
+                state.group_order = match v {
+                    0x0 => message::GroupOrder::Publisher,
+                    0x1 => message::GroupOrder::Ascending,
+                    0x2 => message::GroupOrder::Descending,
+                    _ => message::GroupOrder::Ascending,
+                };
+            }
         }
 
         Ok(())

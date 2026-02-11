@@ -4,7 +4,7 @@ use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
     coding::KeyValuePairs,
-    message::{FilterType, GroupOrder, PublishOk},
+    message::PublishOk,
     serve::{ServeError, Tracks},
     session::{PublishNamespaceReceived, PublishReceived, SessionError, Subscriber},
 };
@@ -204,12 +204,6 @@ impl Consumer {
 
         let msg = PublishOk {
             id: publish.info.id,
-            forward: true,
-            subscriber_priority: 127,
-            group_order: GroupOrder::Publisher,
-            filter_type: FilterType::LargestObject,
-            start_location: None,
-            end_group_id: None,
             params: KeyValuePairs::default(),
         };
 

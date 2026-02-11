@@ -379,28 +379,14 @@ pub fn reqeust_ok_created(time: f64, stream_id: u64, msg: &message::RequestOk) -
     )
 }
 
-/// Helper to convert PUBLISH message to JSON
 fn publish_to_json(msg: &message::Publish) -> JsonValue {
-    let mut json = json!({
+    json!({
         "publish_id": msg.id,
         "track_namespace": msg.track_namespace.to_string(),
         "track_name": &msg.track_name,
         "track_alias": msg.track_alias,
-        "group_order": format!("{:?}", msg.group_order),
-        "content_exists": msg.content_exists,
-        "forward": msg.forward,
         "parameters": key_value_pairs_to_vec(&msg.params.0),
-    });
-
-    // Add optional largest_location fields if content exists
-    if msg.content_exists {
-        if let Some(largest) = &msg.largest_location {
-            json["largest_group_id"] = json!(largest.group_id);
-            json["largest_object_id"] = json!(largest.object_id);
-        }
-    }
-
-    json
+    })
 }
 
 /// Create a control_message_parsed event for PUBLISH
@@ -413,27 +399,11 @@ pub fn publish_created(time: f64, stream_id: u64, msg: &message::Publish) -> Eve
     create_control_message_event(time, stream_id, false, "publish", publish_to_json(msg))
 }
 
-/// Helper to convert PUBLISH_OK message to JSON
 fn publish_ok_to_json(msg: &message::PublishOk) -> JsonValue {
-    let mut json = json!({
+    json!({
         "publish_id": msg.id,
-        "forward": msg.forward,
-        "subscriber_priority": msg.subscriber_priority,
-        "group_order": format!("{:?}", msg.group_order),
-        "filter_type": format!("{:?}", msg.filter_type),
         "parameters": key_value_pairs_to_vec(&msg.params.0),
-    });
-
-    // Add optional fields based on filter type
-    if let Some(start_loc) = &msg.start_location {
-        json["start_group"] = json!(start_loc.group_id);
-        json["start_object"] = json!(start_loc.object_id);
-    }
-    if let Some(end_group) = msg.end_group_id {
-        json["end_group"] = json!(end_group);
-    }
-
-    json
+    })
 }
 
 /// Create a control_message_parsed event for PUBLISH_OK
