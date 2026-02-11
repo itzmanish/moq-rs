@@ -118,8 +118,12 @@ impl Subscribed {
         match track.mode().await? {
             // TODO cancel track/datagrams on closed
             TrackReaderMode::Stream(_stream) => panic!("deprecated"),
-            TrackReaderMode::Subgroups(subgroups) => self.serve_subgroups(subgroups).await,
-            TrackReaderMode::Datagrams(datagrams) => self.serve_datagrams(datagrams).await,
+            TrackReaderMode::Subgroups(subgroups) => {
+                self.serve_subgroups(subgroups, track_alias).await
+            }
+            TrackReaderMode::Datagrams(datagrams) => {
+                self.serve_datagrams(datagrams, track_alias).await
+            }
         }
     }
 
@@ -189,6 +193,7 @@ impl Subscribed {
     async fn serve_subgroups(
         &mut self,
         mut subgroups: serve::SubgroupsReader,
+        track_alias: u64,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
         let mut done: Option<Result<(), ServeError>> = None;
@@ -199,7 +204,7 @@ impl Subscribed {
                     Ok(Some(subgroup)) => {
                         let header = data::SubgroupHeader {
                             header_type: data::StreamHeaderType::SubgroupIdExt,  // SubGroupId = Yes, Extensions = Yes, ContainsEndOfGroup = No
-                            track_alias: self.info.id, // use subscription id as track_alias
+                            track_alias,
                             group_id: subgroup.group_id,
                             subgroup_id: Some(subgroup.subgroup_id),
                             publisher_priority: Some(subgroup.priority),
@@ -356,6 +361,7 @@ impl Subscribed {
     async fn serve_datagrams(
         &mut self,
         mut datagrams: serve::DatagramsReader,
+        track_alias: u64,
     ) -> Result<(), SessionError> {
         log::debug!("[PUBLISHER] serve_datagrams: starting");
 
@@ -371,7 +377,7 @@ impl Subscribed {
 
             let encoded_datagram = data::Datagram {
                 datagram_type,
-                track_alias: self.info.id, // use subscription id as track_alias
+                track_alias,
                 group_id: datagram.group_id,
                 object_id: Some(datagram.object_id),
                 publisher_priority: Some(datagram.priority),
