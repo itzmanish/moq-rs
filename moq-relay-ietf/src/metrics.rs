@@ -45,6 +45,93 @@
 //! |------|--------|-------------|
 //! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found, route_error) |
 
+use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+
+// ============================================================================
+// describe_metrics - Register metric descriptions for Prometheus HELP text
+// ============================================================================
+
+/// Register metric descriptions with the metrics recorder.
+///
+/// Call this once after installing a metrics recorder (e.g., Prometheus exporter).
+/// The descriptions appear as `# HELP` comments in Prometheus output.
+pub fn describe_metrics() {
+    // Counters
+    describe_counter!(
+        "moq_relay_connections_total",
+        "Total incoming connections accepted"
+    );
+    describe_counter!(
+        "moq_relay_connections_closed_total",
+        "Total connections that have closed (graceful or error)"
+    );
+    describe_counter!(
+        "moq_relay_connection_errors_total",
+        "Connection failures by stage (session_accept, session_run)"
+    );
+    describe_counter!(
+        "moq_relay_publishers_total",
+        "Total publishers (ANNOUNCE requests) received"
+    );
+    describe_counter!(
+        "moq_relay_announce_ok_total",
+        "Successful ANNOUNCE_OK responses sent"
+    );
+    describe_counter!(
+        "moq_relay_announce_errors_total",
+        "Announce failures by phase (coordinator_register, local_register, send_ok)"
+    );
+    describe_counter!(
+        "moq_relay_subscribers_total",
+        "Total subscribers (SUBSCRIBE requests) received"
+    );
+    describe_counter!(
+        "moq_relay_subscribe_not_found_total",
+        "Track not found after checking all sources"
+    );
+    describe_counter!(
+        "moq_relay_subscribe_route_errors_total",
+        "Infrastructure failure when routing to remote"
+    );
+    describe_counter!(
+        "moq_relay_upstream_errors_total",
+        "Upstream connection failures by stage (connect, session)"
+    );
+
+    // Gauges
+    describe_gauge!(
+        "moq_relay_active_connections",
+        "Current number of active client connections"
+    );
+    describe_gauge!(
+        "moq_relay_active_publishers",
+        "Current number of active publishers"
+    );
+    describe_gauge!(
+        "moq_relay_active_subscriptions",
+        "Current number of active subscriptions"
+    );
+    describe_gauge!(
+        "moq_relay_active_tracks",
+        "Current number of tracks being served"
+    );
+    describe_gauge!(
+        "moq_relay_announced_namespaces",
+        "Current number of registered namespaces"
+    );
+    describe_gauge!(
+        "moq_relay_upstream_connections",
+        "Current number of upstream/origin connections"
+    );
+
+    // Histograms
+    describe_histogram!(
+        "moq_relay_subscribe_latency_seconds",
+        Unit::Seconds,
+        "Time to resolve subscription by source (local, remote, not_found, route_error)"
+    );
+}
+
 // ============================================================================
 // GaugeGuard - RAII guard for gauge increment/decrement
 // ============================================================================

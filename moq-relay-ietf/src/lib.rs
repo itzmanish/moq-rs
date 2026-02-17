@@ -32,7 +32,7 @@ mod api;
 mod consumer;
 mod coordinator;
 mod local;
-mod metrics;
+pub mod metrics;
 mod producer;
 mod relay;
 mod remote;
