@@ -75,16 +75,17 @@ impl SessionError {
     /// (NO_ERROR). This is normal session termination, not an error condition.
     ///
     /// This method checks for:
-    /// - WebTransport close with code 0 (HTTP/3 encoded as 0x52e4a40fa8db)
+    /// - WebTransport `Closed(0, _)` — decoded by web-transport-quinn v0.11+ from
+    ///   HTTP/3 encoded close codes
     /// - Raw QUIC `ApplicationClosed` with code 0
     /// - The local side closing the connection (`LocallyClosed`)
     ///
     /// ## Implementation Notes
     ///
-    /// We pattern match on `web_transport_quinn::SessionError` variants to access the
-    /// underlying `quinn::ConnectionError`. For WebTransport connections, the close code
-    /// is encoded using HTTP/3 error code space, which we decode using
-    /// `web_transport_proto::error_from_http3()`.
+    /// We pattern match on `web_transport_quinn::SessionError` variants. In v0.11+,
+    /// WebTransport graceful closes arrive as `WebTransportError::Closed(0, _)` because
+    /// the crate decodes HTTP/3 error codes at the `SessionError` level. For raw QUIC
+    /// connections, the close code is checked directly on `ConnectionError::ApplicationClosed`.
     ///
     /// **Coupling note**: This implementation is coupled to `web-transport-quinn` and
     /// `quinn`. When transitioning to a different WebTransport backend (e.g., tokio-quiche),
@@ -126,15 +127,20 @@ impl From<SessionError> for serve::ServeError {
 
 /// Helper to check if a `web_transport_quinn::SessionError` represents a graceful close.
 ///
-/// This handles both:
-/// - Raw QUIC connections: `ApplicationClosed` with code 0
-/// - WebTransport connections: `ApplicationClosed` with HTTP/3 encoded code that decodes to 0
+/// This handles:
+/// - WebTransport connections: `WebTransportError::Closed(0, _)` — the new web-transport-quinn
+///   v0.11 crate decodes HTTP/3-encoded close codes at this layer, so a WebTransport graceful
+///   close (code 0) arrives here rather than as a raw `ConnectionError::ApplicationClosed`.
+/// - Raw QUIC connections: `ConnectionError::ApplicationClosed` with code 0
+/// - Local close: `ConnectionError::LocallyClosed`
 fn is_session_error_graceful(err: &web_transport::quinn::SessionError) -> bool {
-    use web_transport::quinn::SessionError;
+    use web_transport::quinn::{SessionError, WebTransportError};
 
     match err {
         SessionError::ConnectionError(conn_err) => is_connection_error_graceful(conn_err),
-        // WebTransportError doesn't represent connection close
+        // WebTransport graceful close: peer sent close with code 0
+        SessionError::WebTransportError(WebTransportError::Closed(0, _)) => true,
+        // Other WebTransport errors (UnknownSession, read/write errors, non-zero close codes)
         SessionError::WebTransportError(_) => false,
         // SendDatagramError doesn't represent connection close
         SessionError::SendDatagramError(_) => false,
@@ -142,6 +148,11 @@ fn is_session_error_graceful(err: &web_transport::quinn::SessionError) -> bool {
 }
 
 /// Helper to check if a `quinn::ConnectionError` represents a graceful close.
+///
+/// Note: In web-transport-quinn v0.11+, WebTransport `ApplicationClosed` with an HTTP/3-encoded
+/// close code is converted to `WebTransportError::Closed` before reaching here. So this function
+/// primarily handles raw QUIC (moqt:// ALPN) connections where the close code is not HTTP/3
+/// encoded.
 fn is_connection_error_graceful(err: &quinn::ConnectionError) -> bool {
     use quinn::ConnectionError;
 
@@ -155,7 +166,8 @@ fn is_connection_error_graceful(err: &quinn::ConnectionError) -> bool {
             }
 
             // Check for WebTransport code 0 (HTTP/3 encoded)
-            // WebTransport code 0 maps to HTTP/3 code 0x52e4a40fa8db
+            // This is a fallback — in v0.11+, WebTransport closes are typically caught
+            // by is_session_error_graceful's WebTransportError::Closed branch.
             if let Some(wt_code) = web_transport_proto::error_from_http3(code) {
                 return wt_code == 0;
             }
