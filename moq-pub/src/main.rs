@@ -12,7 +12,7 @@ use moq_pub::Media;
 use moq_transport::{
     coding::TrackNamespace,
     serve::{self, TracksReader},
-    session::{Publisher, SessionError},
+    session::{PublishNamespace, Publisher, SessionError},
 };
 
 #[derive(Parser, Clone)]
@@ -42,12 +42,24 @@ pub struct Cli {
     /// The TLS configuration.
     #[command(flatten)]
     pub tls: moq_native_ietf::tls::Args,
+
+    /// Whether to publish to the catalog or wait for a subscribe
+    /// aka PUSH based publisher
+    #[arg(long, default_value = "false")]
+    pub publish: bool,
 }
 
 async fn serve_subscriptions(
     mut publisher: Publisher,
     tracks: TracksReader,
+    publish_ns: &PublishNamespace,
+    publish: bool,
 ) -> Result<(), SessionError> {
+    publish_ns.ok().await?;
+
+    if publish {
+        return publish_track(publisher, tracks).await;
+    }
     let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
         FuturesUnordered::new();
 
@@ -68,6 +80,25 @@ async fn serve_subscriptions(
             else => return Ok(()),
         }
     }
+}
+
+async fn publish_track(mut publisher: Publisher, tracks: TracksReader) -> Result<(), SessionError> {
+    let active_tracks = tracks.get_active_tracks();
+    log::info!("publishing {} tracks", active_tracks.len());
+
+    let mut tasks = FuturesUnordered::new();
+    for track in active_tracks {
+        let published = publisher.publish(&track).await?;
+        let info = published.info.clone();
+        tasks.push(async move {
+            if let Err(err) = published.serve(track).await {
+                log::warn!("failed serving publish: {:?}, error: {}", info, err);
+            }
+        });
+    }
+
+    while tasks.next().await.is_some() {}
+    Ok(())
 }
 
 #[tokio::main]
@@ -119,8 +150,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         res = session.run() => res.context("session error")?,
         res = run_media(media) => res.context("media error")?,
-        res = serve_subscriptions(publisher, reader) => res.context("publisher error")?,
-        res = publish_ns.closed() => res.context("publisher error")?,
+        res = serve_subscriptions(publisher, reader, &publish_ns, cli.publish) => res.context("publisher error")?,
+        res = publish_ns.closed() => res.context("namespace closed")?,
     }
 
     Ok(())

@@ -154,6 +154,9 @@ impl Producer {
         Err(err.into())
     }
 
+    /// FIXME: Currently the limitation of serve_subscribe_namespace is any
+    /// new publish or publish_namespace coming to the relay is not getting
+    /// forwarded if they match the subscribe namespace's track namespace.
     async fn serve_subscribe_namespace(
         mut self,
         mut subscribe_ns: SubscribeNamespaceReceived,
@@ -174,7 +177,10 @@ impl Producer {
         subscribe_ns.ok()?;
 
         let mut active_publish_namespaces = Vec::new();
-
+        // FIXME: We currently send all matching namespaces, even if
+        // they are already subscribed to. This is not correct.
+        // Instead, we should only send the ones that are not already
+        // subscribed to.
         for namespace in matching_namespaces {
             log::info!(
                 "sending PUBLISH_NAMESPACE for {:?} (matched prefix {:?})",

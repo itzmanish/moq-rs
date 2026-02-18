@@ -149,7 +149,7 @@ impl Consumer {
         }
     }
 
-    async fn serve_publish(self, publish: PublishReceived) -> Result<(), anyhow::Error> {
+    async fn serve_publish(self, mut publish: PublishReceived) -> Result<(), anyhow::Error> {
         let namespace = publish.info.track_namespace.clone();
         let track_name = publish.info.track_name.clone();
 
@@ -165,8 +165,12 @@ impl Consumer {
                     "PUBLISH rejected: no PUBLISH_NAMESPACE registered for namespace {}",
                     namespace
                 );
-                publish.reject(0x4, "Namespace not announced via PUBLISH_NAMESPACE")?;
-                return Err(ServeError::NotFound.into());
+                let err = ServeError::not_found_full(
+                    "no PUBLISH_NAMESPACE registered for namespace",
+                    "Namespace not announced",
+                );
+                publish.close(err.clone())?;
+                return Err(err.into());
             }
         };
 
@@ -178,7 +182,7 @@ impl Consumer {
                     namespace,
                     track_name
                 );
-                publish.reject(ServeError::Uninterested.code(), "Already subscribed")?;
+                publish.close(ServeError::Uninterested)?;
                 return Err(ServeError::Uninterested.into());
             }
             Err(ServeError::Duplicate) => {
@@ -187,11 +191,11 @@ impl Consumer {
                     namespace,
                     track_name
                 );
-                publish.reject(ServeError::Duplicate.code(), "Already publishing")?;
+                publish.close(ServeError::Duplicate)?;
                 return Err(ServeError::Duplicate.into());
             }
             Err(e) => {
-                publish.reject(e.code(), &e.to_string())?;
+                publish.close(e.clone())?;
                 return Err(e.into());
             }
         };
@@ -220,6 +224,9 @@ impl Consumer {
             namespace,
             track_name
         );
+
+        // Hold publish alive until the stream closes (PUBLISH_DONE triggers recv_done)
+        let _ = publish.closed().await;
 
         Ok(())
     }
