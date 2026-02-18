@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "moq-api"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "axum",
  "clap",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "moq-clock-ietf"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "moq-native-ietf"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1307,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "moq-pub"
-version = "0.8.8"
+version = "0.8.9"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1326,7 +1326,7 @@ dependencies = [
 
 [[package]]
 name = "moq-relay-ietf"
-version = "0.7.10"
+version = "0.7.11"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "moq-sub"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "moq-test-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1386,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "moq-transport"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "bytes",
  "futures",

@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.3](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.12.2...moq-transport-v0.12.3) - 2026-02-18
+
+### Added
+
+- add additional debug logging for troubleshooting
+- add structured debug logging for MoQT control messages
+- *(metrics)* distinguish graceful close from connection errors
+
+### Fixed
+
+- cargo fmt and clippy lints
+- *(metrics)* address review feedback for metrics instrumentation
+
+### Other
+
+- migrate from log crate to tracing
+
 ## [0.12.2](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.12.1...moq-transport-v0.12.2) - 2026-01-29
 
 ### Fixed
