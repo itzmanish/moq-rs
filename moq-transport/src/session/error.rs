@@ -155,8 +155,8 @@ fn is_session_error_graceful(err: &web_transport::quinn::SessionError) -> bool {
 /// close code is converted to `WebTransportError::Closed` before reaching here. So this function
 /// primarily handles raw QUIC (moqt:// ALPN) connections where the close code is not HTTP/3
 /// encoded.
-fn is_connection_error_graceful(err: &quinn::ConnectionError) -> bool {
-    use quinn::ConnectionError;
+fn is_connection_error_graceful(err: &web_transport::quinn::quinn::ConnectionError) -> bool {
+    use web_transport::quinn::quinn::ConnectionError;
 
     match err {
         ConnectionError::ApplicationClosed(close) => {
@@ -170,7 +170,7 @@ fn is_connection_error_graceful(err: &quinn::ConnectionError) -> bool {
             // Check for WebTransport code 0 (HTTP/3 encoded)
             // This is a fallback — in v0.11+, WebTransport closes are typically caught
             // by is_session_error_graceful's WebTransportError::Closed branch.
-            if let Some(wt_code) = web_transport_proto::error_from_http3(code) {
+            if let Some(wt_code) = web_transport::quinn::proto::error_from_http3(code) {
                 return wt_code == 0;
             }
 
