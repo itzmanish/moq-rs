@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.11](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.10...moq-relay-ietf-v0.7.11) - 2026-02-18
+
+### Added
+
+- add additional debug logging for troubleshooting
+- add structured fields to high-value log messages
+- *(metrics)* add describe_metrics() for Prometheus HELP text
+- *(metrics)* distinguish graceful close from connection errors
+- *(moq-relay-ietf)* add optional prometheus exporter for metrics validation
+- *(moq-relay-ietf)* add metrics instrumentation via metrics crate facade
+
+### Fixed
+
+- cargo fmt and clippy lints
+- *(metrics)* move upstream_connections gauge after successful connect
+- *(metrics)* address review feedback for metrics instrumentation
+
+### Other
+
+- migrate from log crate to tracing
+- *(metrics)* make metrics always-on, remove feature gate
+
 ## [0.7.10](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.9...moq-relay-ietf-v0.7.10) - 2026-01-29
 
 ### Other
