@@ -7,7 +7,7 @@ use moq_transport::{
     session::{Announced, SessionError, Subscriber},
 };
 
-use crate::{Coordinator, Locals, Producer};
+use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer};
 
 /// Consumer of tracks from a remote Publisher
 #[derive(Clone)]
@@ -41,6 +41,8 @@ impl Consumer {
             tokio::select! {
                 // Handle a new announce request
                 Some(announce) = self.subscriber.announced() => {
+                    metrics::counter!("moq_relay_publishers_total").increment(1);
+
                     let this = self.clone();
 
                     tasks.push(async move {
@@ -49,7 +51,8 @@ impl Consumer {
 
                         // Serve the announce request
                         if let Err(err) = this.serve(announce).await {
-                            log::warn!("failed serving announce: {:?}, error: {}", info, err)
+                            log::warn!("failed serving announce: {:?}, error: {}", info, err);
+                            // Note: phase-specific error counters are incremented in serve()
                         }
                     });
                 },
@@ -61,6 +64,9 @@ impl Consumer {
 
     /// Serve an announce request.
     async fn serve(mut self, mut announce: Announced) -> Result<(), anyhow::Error> {
+        // Track active publishers - decrements when this function returns
+        let _publisher_guard = GaugeGuard::new("moq_relay_active_publishers");
+
         let mut tasks = FuturesUnordered::new();
 
         // Produce the tracks for this announce and return the reader
@@ -72,16 +78,37 @@ impl Consumer {
         // should we allow the same namespace being served from multiple relays??
 
         // Register namespace with the coordinator
-        let _namespace_registration = self
+        let _namespace_registration = match self
             .coordinator
             .register_namespace(&reader.namespace)
-            .await?;
+            .await
+        {
+            Ok(reg) => reg,
+            Err(err) => {
+                metrics::counter!("moq_relay_announce_errors_total", "phase" => "coordinator_register")
+                    .increment(1);
+                return Err(err.into());
+            }
+        };
 
         // Register the local tracks, unregister on drop
-        let _register = self.locals.register(reader.clone()).await?;
+        let _register = match self.locals.register(reader.clone()).await {
+            Ok(reg) => reg,
+            Err(err) => {
+                metrics::counter!("moq_relay_announce_errors_total", "phase" => "local_register")
+                    .increment(1);
+                return Err(err);
+            }
+        };
 
         // Accept the announce with an OK response
-        announce.ok()?;
+        if let Err(err) = announce.ok() {
+            metrics::counter!("moq_relay_announce_errors_total", "phase" => "send_ok").increment(1);
+            return Err(err.into());
+        }
+
+        // Successfully sent ANNOUNCE_OK
+        metrics::counter!("moq_relay_announce_ok_total").increment(1);
 
         // Forward the announce, if needed
         if let Some(mut forward) = self.forward {

@@ -8,6 +8,8 @@ use moq_transport::{
     serve::{ServeError, TracksReader},
 };
 
+use crate::metrics::GaugeGuard;
+
 /// Registry of local tracks
 #[derive(Clone)]
 pub struct Locals {
@@ -41,6 +43,7 @@ impl Locals {
         let registration = Registration {
             locals: self.clone(),
             namespace,
+            _gauge_guard: GaugeGuard::new("moq_relay_announced_namespaces"),
         };
 
         Ok(registration)
@@ -78,6 +81,8 @@ impl Locals {
 pub struct Registration {
     locals: Locals,
     namespace: TrackNamespace,
+    /// Gauge guard for tracking announced namespaces - decrements on drop
+    _gauge_guard: GaugeGuard,
 }
 
 /// Deregister local tracks on drop.
