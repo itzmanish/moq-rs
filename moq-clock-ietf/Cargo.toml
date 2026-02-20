@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/englishm/moq-rs"
 license = "MIT OR Apache-2.0"
 
-version = "0.6.8"
+version = "0.6.10"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]
@@ -15,7 +15,7 @@ categories = ["multimedia", "network-programming", "web-programming"]
 
 [dependencies]
 moq-native-ietf = { path = "../moq-native-ietf", version = "0.7" }
-moq-transport = { path = "../moq-transport", version = "0.12" }
+moq-transport = { path = "../moq-transport", version = "0.13" }
 
 # QUIC
 url = "2"
@@ -26,11 +26,9 @@ futures = "0.3"
 
 # CLI, logging, error handling
 clap = { version = "4", features = ["derive"] }
-log = { workspace = true }
-env_logger = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 anyhow = { version = "1", features = ["backtrace"] }
-tracing = "0.1"
-tracing-subscriber = "0.3"
 
 # CLOCK STUFF
 chrono = "0.4"

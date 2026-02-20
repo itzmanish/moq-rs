@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/englishm/moq-rs"
 license = "MIT OR Apache-2.0"
 
-version = "0.2.7"
+version = "0.2.9"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]
@@ -38,6 +38,6 @@ redis = { version = "0.32", features = [
 url = { version = "2", features = ["serde"] }
 
 # Error handling
-log = { workspace = true }
-env_logger = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 thiserror = "1"

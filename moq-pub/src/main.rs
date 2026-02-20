@@ -68,11 +68,11 @@ async fn serve_subscriptions(
             Some(subscribed) = publisher.subscribed() => {
                 let info = subscribed.info.clone();
                 let tracks = tracks.clone();
-                log::info!("serving subscribe: {:?}", info);
+                tracing::info!("serving subscribe: {:?}", info);
 
                 tasks.push(async move {
                     if let Err(err) = Publisher::serve_subscribe(subscribed, tracks).await {
-                        log::warn!("failed serving subscribe: {:?}, error: {}", info, err);
+                        tracing::warn!("failed serving subscribe: {:?}, error: {}", info, err);
                     }
                 }.boxed());
             }
@@ -84,7 +84,7 @@ async fn serve_subscriptions(
 
 async fn publish_track(mut publisher: Publisher, tracks: TracksReader) -> Result<(), SessionError> {
     let active_tracks = tracks.get_active_tracks();
-    log::info!("publishing {} tracks", active_tracks.len());
+    tracing::info!("publishing {} tracks", active_tracks.len());
 
     let mut tasks = FuturesUnordered::new();
     for track in active_tracks {
@@ -92,7 +92,7 @@ async fn publish_track(mut publisher: Publisher, tracks: TracksReader) -> Result
         let info = published.info.clone();
         tasks.push(async move {
             if let Err(err) = published.serve(track).await {
-                log::warn!("failed serving publish: {:?}, error: {}", info, err);
+                tracing::warn!("failed serving publish: {:?}, error: {}", info, err);
             }
         });
     }
@@ -103,13 +103,14 @@ async fn publish_track(mut publisher: Publisher, tracks: TracksReader) -> Result
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
-
-    // Disable tracing so we don't get a bunch of Quinn spam.
-    let tracer = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    tracing::subscriber::set_global_default(tracer).unwrap();
+    // Initialize tracing with env filter (respects RUST_LOG environment variable)
+    // Default to info level, but suppress quinn's verbose output
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
+        )
+        .init();
 
     let cli = Cli::parse();
 
@@ -125,10 +126,10 @@ async fn main() -> anyhow::Result<()> {
         tls.clone(),
     ))?;
 
-    log::info!("connecting to relay: url={}", cli.url);
+    tracing::info!("connecting to relay: url={}", cli.url);
     let (session, connection_id) = quic.client.connect(&cli.url, None).await?;
 
-    log::info!(
+    tracing::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
         connection_id
     );
@@ -145,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to register namespace")?;
 
-    log::info!("namespace registered, starting media and subscription handling");
+    tracing::info!("namespace registered, starting media and subscription handling");
 
     tokio::select! {
         res = session.run() => res.context("session error")?,

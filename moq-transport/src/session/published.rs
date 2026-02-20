@@ -214,7 +214,7 @@ impl Published {
 
                         tasks.push(async move {
                             if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog).await {
-                                log::warn!("failed to serve subgroup: {:?}, error: {}", info, err);
+                                tracing::warn!("failed to serve subgroup: {:?}, error: {}", info, err);
                             }
                         });
                     },
@@ -235,7 +235,7 @@ impl Published {
         state: State<PublishedState>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
-        log::debug!(
+        tracing::debug!(
             "[PUBLISHED] serve_subgroup: starting - group_id={}, subgroup_id={:?}, priority={}",
             subgroup_reader.group_id,
             subgroup_reader.subgroup_id,
@@ -247,7 +247,7 @@ impl Published {
 
         let mut writer = Writer::new(send_stream);
 
-        log::debug!(
+        tracing::debug!(
             "[PUBLISHED] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
             header.track_alias,
             header.group_id,
@@ -280,7 +280,7 @@ impl Published {
                 },
             };
 
-            log::debug!(
+            tracing::debug!(
                 "[PUBLISHED] serve_subgroup: sending object #{} - object_id={}, object_id_delta={}, payload_length={}, status={:?}",
                 object_count + 1,
                 subgroup_object_reader.object_id,
@@ -322,7 +322,7 @@ impl Published {
             object_count += 1;
         }
 
-        log::info!(
+        tracing::info!(
             "[PUBLISHED] serve_subgroup: completed subgroup (group_id={}, subgroup_id={:?}, {} objects sent)",
             subgroup_reader.group_id,
             subgroup_reader.subgroup_id,
@@ -336,7 +336,7 @@ impl Published {
         &mut self,
         mut datagrams: serve::DatagramsReader,
     ) -> Result<(), SessionError> {
-        log::debug!("[PUBLISHED] serve_datagrams: starting");
+        tracing::debug!("[PUBLISHED] serve_datagrams: starting");
 
         let mut datagram_count = 0;
         while let Some(datagram) = datagrams.read().await? {
@@ -370,7 +370,7 @@ impl Published {
             let mut buffer = bytes::BytesMut::with_capacity(payload_len + 100);
             encoded_datagram.encode(&mut buffer)?;
 
-            log::debug!(
+            tracing::debug!(
                 "[PUBLISHED] serve_datagrams: sending datagram #{} - track_alias={}, group_id={}, object_id={}, priority={}, payload_len={}",
                 datagram_count + 1,
                 encoded_datagram.track_alias,
@@ -405,7 +405,7 @@ impl Published {
             datagram_count += 1;
         }
 
-        log::info!(
+        tracing::info!(
             "[PUBLISHED] serve_datagrams: completed ({} datagrams sent)",
             datagram_count
         );

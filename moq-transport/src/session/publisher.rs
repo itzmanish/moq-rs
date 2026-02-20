@@ -258,7 +258,7 @@ impl Publisher {
         };
 
         if let Err(err) = res {
-            log::warn!("failed to process message: {}", err);
+            tracing::warn!("failed to process message: {}", err);
         }
 
         Ok(())

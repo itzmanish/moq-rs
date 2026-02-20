@@ -27,11 +27,11 @@ async fn serve_subscriptions(
             Some(subscribed) = publisher.subscribed() => {
                 let info = subscribed.info.clone();
                 let tracks = tracks.clone();
-                log::info!("serving subscribe: {:?}", info);
+                tracing::info!("serving subscribe: {:?}", info);
 
                 tasks.push(async move {
                     if let Err(err) = Publisher::serve_subscribe(subscribed, tracks).await {
-                        log::warn!("failed serving subscribe: {:?}, error: {}", info, err);
+                        tracing::warn!("failed serving subscribe: {:?}, error: {}", info, err);
                     }
                 }.boxed());
             }
@@ -43,13 +43,14 @@ async fn serve_subscriptions(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
-
-    // Disable tracing so we don't get a bunch of Quinn spam.
-    let tracer = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    tracing::subscriber::set_global_default(tracer).unwrap();
+    // Initialize tracing with env filter (respects RUST_LOG environment variable)
+    // Default to info level, but suppress quinn's verbose output
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
+        )
+        .init();
 
     let config = Cli::parse();
     let tls = config.tls.load()?;
@@ -57,12 +58,12 @@ async fn main() -> anyhow::Result<()> {
     // Create the QUIC endpoint
     let quic = quic::Endpoint::new(quic::Config::new(config.bind, None, tls))?;
 
-    log::info!("connecting to server: url={}", config.url);
+    tracing::info!("connecting to server: url={}", config.url);
 
     // Connect to the server
     let (session, connection_id) = quic.client.connect(&config.url, None).await?;
 
-    log::info!(
+    tracing::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
         connection_id
     );
@@ -75,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to create MoQ Transport session")?;
 
         if config.datagrams {
-            log::info!("publishing clock via datagrams");
+            tracing::info!("publishing clock via datagrams");
 
             let (mut tracks_writer, _, tracks_reader) = serve::Tracks {
                 namespace: TrackNamespace::from_utf8_path(&config.namespace),
@@ -97,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
                 res = publish_ns.closed() => res.context("namespace closed")?,
             }
         } else {
-            log::info!("publishing clock via streams");
+            tracing::info!("publishing clock via streams");
 
             let (mut tracks_writer, _, tracks_reader) = serve::Tracks {
                 namespace: TrackNamespace::from_utf8_path(&config.namespace),

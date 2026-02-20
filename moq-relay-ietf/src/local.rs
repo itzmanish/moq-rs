@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::metrics::GaugeGuard;
 use moq_transport::{
     coding::TrackNamespace,
     serve::{ServeError, Track, TrackReader, TrackWriter, TracksReader, TracksWriter},
@@ -198,6 +199,7 @@ impl Locals {
         let registration = Registration {
             locals: self.clone(),
             namespace,
+            _gauge_guard: GaugeGuard::new("moq_relay_announced_namespaces"),
         };
 
         Ok(registration)
@@ -351,10 +353,14 @@ impl Locals {
 pub struct Registration {
     locals: Locals,
     namespace: TrackNamespace,
+    /// Gauge guard for tracking announced namespaces - decrements on drop
+    _gauge_guard: GaugeGuard,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
+        let ns = self.namespace.to_utf8_path();
+        tracing::debug!(namespace = %ns, "deregistering namespace from locals");
         self.locals.lookup.lock().unwrap().remove(&self.namespace);
     }
 }

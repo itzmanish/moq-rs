@@ -77,7 +77,7 @@ impl ServeError {
     pub fn not_found_id() -> Self {
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
-        log::warn!("[{}] Not found at {}:{}", id, loc.file(), loc.line());
+        tracing::warn!("[{}] Not found at {}:{}", id, loc.file(), loc.line());
         Self::NotFoundWithId("Track not found".to_string(), id)
     }
 
@@ -90,7 +90,7 @@ impl ServeError {
         let context = internal_context.into();
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
-        log::warn!(
+        tracing::warn!(
             "[{}] Not found: {} at {}:{}",
             id,
             context,
@@ -113,7 +113,7 @@ impl ServeError {
         let message = external_message.into();
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
-        log::warn!(
+        tracing::warn!(
             "[{}] Not found: {} at {}:{}",
             id,
             context,
@@ -132,7 +132,7 @@ impl ServeError {
         let context = internal_context.into();
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
-        log::error!(
+        tracing::error!(
             "[{}] Internal error: {} at {}:{}",
             id,
             context,
@@ -151,7 +151,7 @@ impl ServeError {
         let feature = feature.into();
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
-        log::warn!(
+        tracing::warn!(
             "[{}] Not implemented: {} at {}:{}",
             id,
             feature,

@@ -16,7 +16,7 @@ use moq_transport::serve::{Track, TrackReader, TrackWriter};
 use moq_transport::watch::State;
 use url::Url;
 
-use crate::Coordinator;
+use crate::{metrics::GaugeGuard, Coordinator};
 
 /// Information about remote origins.
 pub struct Remotes {
@@ -84,12 +84,13 @@ impl RemotesProducer {
                     // Spawn a task to serve the remote
                     tasks.push(async move {
                         let info = remote.info.clone();
+                        let remote_url = url.to_string();
 
-                        log::warn!("serving remote: {:?}", info);
+                        tracing::warn!(remote_url = %remote_url, "serving remote: {:?}", info);
 
                         // Run the remote producer
                         if let Err(err) = remote.run().await {
-                            log::warn!("failed serving remote: {:?}, error: {}", info, err);
+                            tracing::warn!(remote_url = %remote_url, error = %err, "failed serving remote: {:?}, error: {}", info, err);
                         }
 
                         url
@@ -234,8 +235,28 @@ impl RemoteProducer {
             &self.quic
         };
         // TODO reuse QUIC and MoQ sessions
-        let (session, _quic_client_initial_cid) = client.connect(&self.url, self.addr).await?;
-        let (session, subscriber) = moq_transport::session::Subscriber::connect(session).await?;
+        let (session, _quic_client_initial_cid) = match client.connect(&self.url, self.addr).await {
+            Ok(session) => session,
+            Err(err) => {
+                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
+                    .increment(1);
+                return Err(err);
+            }
+        };
+        let (session, subscriber) = match moq_transport::session::Subscriber::connect(session).await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
+                    .increment(1);
+                return Err(err.into());
+            }
+        };
+
+        // Track established upstream connections - decrements when this function returns.
+        // Placed after successful connect + session setup so the gauge only reflects
+        // connections that are actually serving, not in-flight attempts.
+        let _upstream_guard = GaugeGuard::new("moq_relay_upstream_connections");
 
         // Run the session
         let mut session = session.run().boxed();
@@ -258,7 +279,9 @@ impl RemoteProducer {
 
                     tasks.push(async move {
                         if let Err(err) = subscriber.subscribe(track).await {
-                            log::warn!("failed serving track: {:?}, error: {}", info, err);
+                            let namespace = info.namespace.to_utf8_path();
+                            let track_name = &info.name;
+                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving track: {:?}, error: {}", info, err);
                         }
                     });
                 }

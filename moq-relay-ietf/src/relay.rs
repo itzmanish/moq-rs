@@ -7,7 +7,8 @@ use moq_native_ietf::quic::{self, Endpoint};
 use url::Url;
 
 use crate::{
-    Consumer, Coordinator, Locals, Producer, Remotes, RemotesConsumer, RemotesProducer, Session,
+    metrics::GaugeGuard, Consumer, Coordinator, Locals, Producer, Remotes, RemotesConsumer,
+    RemotesProducer, Session,
 };
 
 // A type alias for boxed future
@@ -89,7 +90,7 @@ impl Relay {
             if !mlog_dir.is_dir() {
                 anyhow::bail!("mlog path is not a directory: {}", mlog_dir.display());
             }
-            log::info!("mlog output enabled: {}", mlog_dir.display());
+            tracing::info!("mlog output enabled: {}", mlog_dir.display());
         }
 
         let locals = Locals::new();
@@ -129,7 +130,7 @@ impl Relay {
 
         // Start the forwarder, if any
         let forward_producer = if let Some(url) = &self.announce_url {
-            log::info!("forwarding announces to {}", url);
+            tracing::info!("forwarding announces to {}", url);
 
             // Establish a QUIC connection to the forward URL
             let (session, _quic_client_initial_cid) = self.quic_endpoints[0]
@@ -183,7 +184,7 @@ impl Relay {
         // This will hold the futures for all our listening servers.
         let mut accepts: FuturesUnordered<ServerFuture> = FuturesUnordered::new();
         for mut server in servers {
-            log::info!("listening on {}", server.local_addr()?);
+            tracing::info!("listening on {}", server.local_addr()?);
 
             // Create a future, box it, and push it to the collection.
             accepts.push(
@@ -211,6 +212,8 @@ impl Relay {
 
                     let (conn, connection_id) = conn_result.context("failed to accept QUIC connection")?;
 
+                    metrics::counter!("moq_relay_connections_total").increment(1);
+
                     // Construct mlog path from connection ID if mlog directory is configured
                     let mlog_path = self.mlog_dir.as_ref()
                         .map(|dir| dir.join(format!("{}_server.mlog", connection_id)));
@@ -222,11 +225,17 @@ impl Relay {
 
                     // Spawn a new task to handle the connection
                     tasks.push(async move {
+                        // Track active connections - decrements when task completes
+                        let _conn_guard = GaugeGuard::new("moq_relay_active_connections");
+
                         // Create the MoQ session over the connection (setup handshake etc)
                         let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path).await {
                             Ok(session) => session,
                             Err(err) => {
-                                log::warn!("failed to accept MoQ session: {}", err);
+                                tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);
+                                metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_accept").increment(1);
+                                // Maintain invariant: connections_total - connections_closed_total == active_connections
+                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 return Ok(());
                             }
                         };
@@ -239,8 +248,22 @@ impl Relay {
                             consumer: subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward)),
                         };
 
-                        if let Err(err) = session.run().await {
-                            log::warn!("failed to run MoQ session: {}", err);
+                        match session.run().await {
+                            Ok(()) => {
+                                // Session ended cleanly (uncommon - usually ends via close)
+                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                            }
+                            Err(err) if err.is_graceful_close() => {
+                                // Graceful close - peer sent APPLICATION_CLOSE with code 0
+                                tracing::debug!("MoQ session closed gracefully");
+                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                            }
+                            Err(err) => {
+                                // Actual error - protocol violation, timeout, etc.
+                                tracing::warn!(error = %err, "MoQ session error: {}", err);
+                                metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_run").increment(1);
+                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                            }
                         }
 
                         Ok(())

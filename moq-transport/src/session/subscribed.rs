@@ -218,7 +218,7 @@ impl Subscribed {
 
                         tasks.push(async move {
                             if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog).await {
-                                log::warn!("failed to serve subgroup: {:?}, error: {}", info, err);
+                                tracing::warn!("failed to serve subgroup: {:?}, error: {}", info, err);
                             }
                         });
                     },
@@ -239,7 +239,7 @@ impl Subscribed {
         state: State<SubscribedState>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
-        log::debug!(
+        tracing::debug!(
             "[PUBLISHER] serve_subgroup: starting - group_id={}, subgroup_id={:?}, priority={}",
             subgroup_reader.group_id,
             subgroup_reader.subgroup_id,
@@ -247,14 +247,14 @@ impl Subscribed {
         );
 
         let mut send_stream = publisher.open_uni().await?;
-        log::trace!("[PUBLISHER] serve_subgroup: opened unidirectional stream");
+        tracing::trace!("[PUBLISHER] serve_subgroup: opened unidirectional stream");
 
         // TODO figure out u32 vs u64 priority
         send_stream.set_priority(subgroup_reader.priority as i32);
 
         let mut writer = Writer::new(send_stream);
 
-        log::debug!(
+        tracing::debug!(
             "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
             header.track_alias,
             header.group_id,
@@ -278,7 +278,7 @@ impl Subscribed {
         let mut object_count = 0;
         while let Some(mut subgroup_object_reader) = subgroup_reader.next().await? {
             if state.lock().is_closed() {
-                log::debug!(
+                tracing::debug!(
                     "[PUBLISHER] serve_subgroup: subscription cancelled, stopping (group_id={}, subgroup_id={:?}, {} objects sent)",
                     subgroup_reader.group_id,
                     subgroup_reader.subgroup_id,
@@ -299,7 +299,7 @@ impl Subscribed {
                 },
             };
 
-            log::debug!(
+            tracing::debug!(
                 "[PUBLISHER] serve_subgroup: sending object #{} - object_id={}, object_id_delta={}, payload_length={}, status={:?}, extension_headers={:?}",
                 object_count + 1,
                 subgroup_object_reader.object_id,
@@ -340,13 +340,13 @@ impl Subscribed {
             let mut bytes_sent = 0;
             while let Some(chunk) = subgroup_object_reader.read().await? {
                 if state.lock().is_closed() {
-                    log::debug!(
+                    tracing::debug!(
                         "[PUBLISHER] serve_subgroup: subscription cancelled during payload transfer"
                     );
                     return Ok(());
                 }
 
-                log::trace!(
+                tracing::trace!(
                     "[PUBLISHER] serve_subgroup: sending payload chunk #{} for object #{} ({} bytes)",
                     chunks_sent + 1,
                     object_count + 1,
@@ -357,7 +357,7 @@ impl Subscribed {
                 chunks_sent += 1;
             }
 
-            log::trace!(
+            tracing::trace!(
                 "[PUBLISHER] serve_subgroup: completed object #{} ({} chunks, {} bytes total)",
                 object_count + 1,
                 chunks_sent,
@@ -366,7 +366,7 @@ impl Subscribed {
             object_count += 1;
         }
 
-        log::info!(
+        tracing::info!(
             "[PUBLISHER] serve_subgroup: completed subgroup (group_id={}, subgroup_id={:?}, {} objects sent)",
             subgroup_reader.group_id,
             subgroup_reader.subgroup_id,
@@ -380,12 +380,12 @@ impl Subscribed {
         &mut self,
         mut datagrams: serve::DatagramsReader,
     ) -> Result<(), SessionError> {
-        log::debug!("[PUBLISHER] serve_datagrams: starting");
+        tracing::debug!("[PUBLISHER] serve_datagrams: starting");
 
         let mut datagram_count = 0;
         while let Some(datagram) = datagrams.read().await? {
             if self.state.lock().is_closed() {
-                log::debug!(
+                tracing::debug!(
                     "[PUBLISHER] serve_datagrams: subscription cancelled, stopping ({} datagrams sent)",
                     datagram_count
                 );
@@ -422,7 +422,7 @@ impl Subscribed {
             let mut buffer = bytes::BytesMut::with_capacity(payload_len + 100);
             encoded_datagram.encode(&mut buffer)?;
 
-            log::debug!(
+            tracing::debug!(
                 "[PUBLISHER] serve_datagrams: sending datagram #{} - track_alias={}, group_id={}, object_id={}, priority={}, payload_len={}, extension_headers={:?}, total_encoded_len={}",
                 datagram_count + 1,
                 encoded_datagram.track_alias,
@@ -460,7 +460,7 @@ impl Subscribed {
             datagram_count += 1;
         }
 
-        log::info!(
+        tracing::info!(
             "[PUBLISHER] serve_datagrams: completed ({} datagrams sent)",
             datagram_count
         );

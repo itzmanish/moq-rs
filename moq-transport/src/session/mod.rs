@@ -68,6 +68,299 @@ impl Session {
             .max() // take the largest
     }
 
+    /// Log a control message with structured fields for observability.
+    /// Uses target "moq_transport::control" so it can be filtered independently.
+    fn log_control_message(msg: &Message, direction: &str) {
+        match msg {
+            Message::Subscribe(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "SUBSCRIBE",
+                    subscribe_id = m.id,
+                    namespace = %m.track_namespace,
+                    track_name = %m.track_name,
+                    filter_type = ?m.filter_type,
+                    "MoQT control message"
+                );
+            }
+            Message::SubscribeOk(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "SUBSCRIBE_OK",
+                    subscribe_id = m.id,
+                    track_alias = m.track_alias,
+                    content_exists = m.content_exists,
+                    "MoQT control message"
+                );
+            }
+            Message::SubscribeError(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "SUBSCRIBE_ERROR",
+                    subscribe_id = m.id,
+                    error_code = m.error_code,
+                    reason = %m.reason_phrase.0,
+                    "MoQT control message"
+                );
+            }
+            Message::SubscribeUpdate(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "SUBSCRIBE_UPDATE",
+                    request_id = m.id,
+                    subscription_request_id = m.subscription_request_id,
+                    "MoQT control message"
+                );
+            }
+            Message::Unsubscribe(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "UNSUBSCRIBE",
+                    subscribe_id = m.id,
+                    "MoQT control message"
+                );
+            }
+            Message::PublishNamespace(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "PUBLISH_NAMESPACE",
+                    request_id = m.id,
+                    namespace = %m.track_namespace,
+                    "MoQT control message"
+                );
+            }
+            Message::PublishNamespaceOk(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "PUBLISH_NAMESPACE_OK",
+                    request_id = m.id,
+                    "MoQT control message"
+                );
+            }
+            Message::PublishNamespaceError(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "PUBLISH_NAMESPACE_ERROR",
+                    request_id = m.id,
+                    error_code = m.error_code,
+                    reason = %m.reason_phrase.0,
+                    "MoQT control message"
+                );
+            }
+            Message::PublishNamespaceDone(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "PUBLISH_NAMESPACE_DONE",
+                    namespace = %m.track_namespace,
+                    "MoQT control message"
+                );
+            }
+            Message::PublishNamespaceCancel(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "PUBLISH_NAMESPACE_CANCEL",
+                    namespace = %m.track_namespace,
+                    error_code = m.error_code,
+                    reason = %m.reason_phrase.0,
+                    "MoQT control message"
+                );
+            }
+            Message::TrackStatus(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "TRACK_STATUS",
+                    request_id = m.id,
+                    namespace = %m.track_namespace,
+                    track_name = %m.track_name,
+                    "MoQT control message"
+                );
+            }
+            Message::TrackStatusOk(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "TRACK_STATUS_OK",
+                    request_id = m.id,
+                    track_alias = m.track_alias,
+                    content_exists = m.content_exists,
+                    "MoQT control message"
+                );
+            }
+            Message::TrackStatusError(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "TRACK_STATUS_ERROR",
+                    request_id = m.id,
+                    error_code = m.error_code,
+                    reason = %m.reason_phrase.0,
+                    "MoQT control message"
+                );
+            }
+            Message::SubscribeNamespace(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "SUBSCRIBE_NAMESPACE",
+                    request_id = m.id,
+                    namespace_prefix = %m.track_namespace_prefix,
+                    "MoQT control message"
+                );
+            }
+            Message::SubscribeNamespaceOk(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "SUBSCRIBE_NAMESPACE_OK",
+                    request_id = m.id,
+                    "MoQT control message"
+                );
+            }
+            Message::SubscribeNamespaceError(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "SUBSCRIBE_NAMESPACE_ERROR",
+                    request_id = m.id,
+                    error_code = m.error_code,
+                    reason = %m.reason_phrase.0,
+                    "MoQT control message"
+                );
+            }
+            Message::UnsubscribeNamespace(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "UNSUBSCRIBE_NAMESPACE",
+                    namespace_prefix = %m.track_namespace_prefix,
+                    "MoQT control message"
+                );
+            }
+            Message::Fetch(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "FETCH",
+                    request_id = m.id,
+                    fetch_type = ?m.fetch_type,
+                    "MoQT control message"
+                );
+            }
+            Message::FetchOk(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "FETCH_OK",
+                    request_id = m.id,
+                    end_of_track = m.end_of_track,
+                    "MoQT control message"
+                );
+            }
+            Message::FetchError(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "FETCH_ERROR",
+                    request_id = m.id,
+                    error_code = m.error_code,
+                    reason = %m.reason_phrase.0,
+                    "MoQT control message"
+                );
+            }
+            Message::FetchCancel(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "FETCH_CANCEL",
+                    request_id = m.id,
+                    "MoQT control message"
+                );
+            }
+            Message::Publish(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "PUBLISH",
+                    request_id = m.id,
+                    namespace = %m.track_namespace,
+                    track_name = %m.track_name,
+                    track_alias = m.track_alias,
+                    "MoQT control message"
+                );
+            }
+            Message::PublishOk(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "PUBLISH_OK",
+                    request_id = m.id,
+                    filter_type = ?m.filter_type,
+                    "MoQT control message"
+                );
+            }
+            Message::PublishError(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "PUBLISH_ERROR",
+                    request_id = m.id,
+                    error_code = m.error_code,
+                    reason = %m.reason_phrase.0,
+                    "MoQT control message"
+                );
+            }
+            Message::PublishDone(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "PUBLISH_DONE",
+                    request_id = m.id,
+                    status_code = m.status_code,
+                    stream_count = m.stream_count,
+                    "MoQT control message"
+                );
+            }
+            Message::GoAway(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "GOAWAY",
+                    uri = %m.uri.0,
+                    "MoQT control message"
+                );
+            }
+            Message::MaxRequestId(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "MAX_REQUEST_ID",
+                    request_id = m.request_id,
+                    "MoQT control message"
+                );
+            }
+            Message::RequestsBlocked(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "REQUESTS_BLOCKED",
+                    max_request_id = m.max_request_id,
+                    "MoQT control message"
+                );
+            }
+        }
+    }
+
     fn new(
         webtransport: web_transport::Session,
         sender: Writer,
@@ -109,12 +402,12 @@ impl Session {
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for
     /// MOQT control messaging.  Performs SETUP messaging and version negotiation.
     pub async fn connect(
-        mut session: web_transport::Session,
+        session: web_transport::Session,
         mlog_path: Option<PathBuf>,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         let mlog = mlog_path.and_then(|path| {
             mlog::MlogWriter::new(path)
-                .map_err(|e| log::warn!("Failed to create mlog: {}", e))
+                .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
                 .ok()
         });
         let control = session.open_bi().await?;
@@ -132,13 +425,25 @@ impl Session {
             params,
         };
 
-        log::debug!("sending CLIENT_SETUP: {:?}", client);
+        tracing::debug!(
+            target: "moq_transport::control",
+            direction = "sent",
+            msg_type = "CLIENT_SETUP",
+            versions = ?client.versions,
+            "MoQT control message"
+        );
         sender.encode(&client).await?;
 
         // TODO: emit client_setup_created event when we add that
 
         let server: setup::Server = recver.decode().await?;
-        log::debug!("received SERVER_SETUP: {:?}", server);
+        tracing::debug!(
+            target: "moq_transport::control",
+            direction = "recv",
+            msg_type = "SERVER_SETUP",
+            version = ?server.version,
+            "MoQT control message"
+        );
 
         // TODO: emit server_setup_parsed event
 
@@ -150,12 +455,12 @@ impl Session {
     /// Accepts an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for
     /// MOQT control messaging.  Performs SETUP messaging and version negotiation.
     pub async fn accept(
-        mut session: web_transport::Session,
+        session: web_transport::Session,
         mlog_path: Option<PathBuf>,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let mut mlog = mlog_path.and_then(|path| {
             mlog::MlogWriter::new(path)
-                .map_err(|e| log::warn!("Failed to create mlog: {}", e))
+                .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
                 .ok()
         });
         let control = session.accept_bi().await?;
@@ -163,7 +468,13 @@ impl Session {
         let mut recver = Reader::new(control.1);
 
         let client: setup::Client = recver.decode().await?;
-        log::debug!("received CLIENT_SETUP: {:?}", client);
+        tracing::debug!(
+            target: "moq_transport::control",
+            direction = "recv",
+            msg_type = "CLIENT_SETUP",
+            versions = ?client.versions,
+            "MoQT control message"
+        );
 
         // Emit mlog event for CLIENT_SETUP parsed
         if let Some(ref mut mlog) = mlog {
@@ -185,7 +496,13 @@ impl Session {
                 params,
             };
 
-            log::debug!("sending SERVER_SETUP: {:?}", server);
+            tracing::debug!(
+                target: "moq_transport::control",
+                direction = "sent",
+                msg_type = "SERVER_SETUP",
+                version = ?server.version,
+                "MoQT control message"
+            );
 
             // Emit mlog event for SERVER_SETUP created
             if let Some(ref mut mlog) = mlog {
@@ -221,7 +538,8 @@ impl Session {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         while let Some(msg) = outgoing.pop().await {
-            log::debug!("sending message: {:?}", msg);
+            // Emit structured tracing log for sent control messages
+            Self::log_control_message(&msg, "sent");
 
             // Emit mlog event for sent control messages
             if let Some(ref mlog) = mlog {
@@ -295,7 +613,9 @@ impl Session {
     ) -> Result<(), SessionError> {
         loop {
             let msg: message::Message = recver.decode().await?;
-            log::debug!("received message: {:?}", msg);
+
+            // Emit structured tracing log for received control messages
+            Self::log_control_message(&msg, "recv");
 
             // Emit mlog event for received control messages
             if let Some(ref mlog) = mlog {
@@ -373,7 +693,7 @@ impl Session {
             };
 
             // TODO GOAWAY, MAX_REQUEST_ID, REQUESTS_BLOCKED
-            log::warn!("Unimplemented message type received: {:?}", msg);
+            tracing::warn!("Unimplemented message type received: {:?}", msg);
             return Err(SessionError::unimplemented(&format!(
                 "message type {:?}",
                 msg
@@ -385,7 +705,7 @@ impl Session {
     /// Will read stream header to know what type of stream it is and create
     /// the appropriate stream handlers.
     async fn run_streams(
-        mut webtransport: web_transport::Session,
+        webtransport: web_transport::Session,
         subscriber: Option<Subscriber>,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
@@ -398,7 +718,7 @@ impl Session {
 
                     tasks.push(async move {
                         if let Err(err) = Subscriber::recv_stream(subscriber, stream).await {
-                            log::warn!("failed to serve stream: {}", err);
+                            tracing::warn!("failed to serve stream: {}", err);
                         };
                     });
                 },
@@ -409,7 +729,7 @@ impl Session {
 
     /// Receives QUIC datagrams and processes them using the Subscriber logic
     async fn run_datagrams(
-        mut webtransport: web_transport::Session,
+        webtransport: web_transport::Session,
         mut subscriber: Option<Subscriber>,
     ) -> Result<(), SessionError> {
         loop {

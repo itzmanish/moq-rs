@@ -78,19 +78,65 @@ pub struct Cli {
     /// Only used when --api-url is specified.
     #[arg(long, default_value = "600")]
     pub api_ttl: u64,
+
+    /// Address to expose Prometheus metrics on (e.g., "127.0.0.1:9090").
+    /// Requires the `metrics-prometheus` feature to be enabled.
+    /// When set, serves metrics at http://<addr>/metrics
+    #[arg(long)]
+    pub metrics_addr: Option<net::SocketAddr>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
-
-    // Disable tracing so we don't get a bunch of Quinn spam.
-    let tracer = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    tracing::subscriber::set_global_default(tracer).unwrap();
+    // Initialize tracing with env filter (respects RUST_LOG environment variable)
+    // Default to info level, but suppress quinn's verbose output
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
+        )
+        .init();
 
     let cli = Cli::parse();
+
+    // Initialize Prometheus metrics exporter if --metrics-addr is provided
+    #[cfg(feature = "metrics-prometheus")]
+    if let Some(metrics_addr) = cli.metrics_addr {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        // Configure histogram buckets for subscribe latency (1ms to 10s)
+        let subscribe_latency_buckets = vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0,
+        ];
+
+        PrometheusBuilder::new()
+            .with_http_listener(metrics_addr)
+            .set_buckets_for_metric(
+                metrics_exporter_prometheus::Matcher::Full(
+                    "moq_relay_subscribe_latency_seconds".to_string(),
+                ),
+                &subscribe_latency_buckets,
+            )?
+            .install()
+            .expect("failed to install Prometheus metrics exporter");
+
+        // Register metric descriptions (shows as # HELP in Prometheus output)
+        moq_relay_ietf::metrics::describe_metrics();
+
+        tracing::info!(
+            "metrics exporter listening on http://{}/metrics",
+            metrics_addr
+        );
+    }
+
+    #[cfg(not(feature = "metrics-prometheus"))]
+    if cli.metrics_addr.is_some() {
+        tracing::warn!(
+            "--metrics-addr was provided but the metrics-prometheus feature is not enabled. \
+             Rebuild with --features metrics-prometheus to enable the Prometheus exporter."
+        );
+    }
+
     let tls = cli.tls.load()?;
 
     if tls.server.is_none() {
@@ -124,10 +170,10 @@ async fn main() -> anyhow::Result<()> {
     let coordinator: Arc<dyn Coordinator> = if let Some(api_url) = &cli.api_url {
         let config = ApiCoordinatorConfig::new(api_url.clone(), relay_url).with_ttl(cli.api_ttl);
         let api_coordinator = ApiCoordinator::new(config);
-        log::info!("using API coordinator: {}", api_url);
+        tracing::info!("using API coordinator: {}", api_url);
         Arc::new(api_coordinator)
     } else {
-        log::info!("using file coordinator: {}", cli.coordinator_file.display());
+        tracing::info!("using file coordinator: {}", cli.coordinator_file.display());
         Arc::new(FileCoordinator::new(&cli.coordinator_file, relay_url))
     };
 

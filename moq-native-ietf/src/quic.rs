@@ -150,7 +150,7 @@ impl Endpoint {
             if !qlog_dir.is_dir() {
                 anyhow::bail!("qlog path is not a directory: {}", qlog_dir.display());
             }
-            log::info!("qlog output enabled: {}", qlog_dir.display());
+            tracing::info!("qlog output enabled: {}", qlog_dir.display());
         }
 
         // Build transport config with our standard settings
@@ -160,7 +160,7 @@ impl Endpoint {
 
         if let Some(mut config) = config.tls.server {
             config.alpn_protocols = vec![
-                web_transport_quinn::ALPN.to_vec(),
+                web_transport_quinn::ALPN.as_bytes().to_vec(),
                 moq_transport::setup::ALPN.to_vec(),
             ];
             config.key_log = Arc::new(rustls::KeyLogFile::new());
@@ -223,7 +223,7 @@ impl Server {
                     match res? {
                         Ok(result) => return Some(result),
                         Err(err) => {
-                            log::warn!("failed to accept QUIC connection: {}", err.root_cause());
+                            tracing::warn!("failed to accept QUIC connection: {}", err.root_cause());
                             continue;
                         }
                     }
@@ -262,7 +262,7 @@ impl Server {
             let mut server_config = (*base_server_config).clone();
             server_config.transport_config(Arc::new(transport));
 
-            log::debug!(
+            tracing::debug!(
                 "qlog enabled: cid={} path={}",
                 connection_id_hex,
                 qlog_path.display()
@@ -285,7 +285,7 @@ impl Server {
         let alpn = String::from_utf8_lossy(&alpn);
         let server_name = handshake.server_name.unwrap_or_default();
 
-        log::debug!(
+        tracing::debug!(
             "received QUIC handshake: cid={} ip={} alpn={} server={}",
             connection_id_hex,
             conn.remote_address(),
@@ -296,7 +296,7 @@ impl Server {
         // Wait for the QUIC connection to be established.
         let conn = conn.await.context("failed to establish QUIC connection")?;
 
-        log::debug!(
+        tracing::debug!(
             "established QUIC connection: cid={} stable_id={} ip={} alpn={} server={}",
             connection_id_hex,
             conn.stable_id(),
@@ -305,22 +305,28 @@ impl Server {
             server_name,
         );
 
-        let session = match alpn.as_bytes() {
-            web_transport_quinn::ALPN => {
-                // Wait for the CONNECT request.
-                let request = web_transport_quinn::accept(conn)
-                    .await
-                    .context("failed to receive WebTransport request")?;
+        let alpn_bytes = alpn.as_bytes();
+        let session = if alpn_bytes == web_transport_quinn::ALPN.as_bytes() {
+            // Wait for the WebTransport CONNECT request (includes H3 SETTINGS exchange).
+            let request = web_transport_quinn::Request::accept(conn)
+                .await
+                .context("failed to receive WebTransport request")?;
 
-                // Accept the CONNECT request.
-                request
-                    .ok()
-                    .await
-                    .context("failed to respond to WebTransport request")?
-            }
-            // A bit of a hack to pretend like we're a WebTransport session
-            moq_transport::setup::ALPN => conn.into(),
-            _ => anyhow::bail!("unsupported ALPN: {}", alpn),
+            // Accept the CONNECT request.
+            request
+                .ok()
+                .await
+                .context("failed to respond to WebTransport request")?
+        } else if alpn_bytes == moq_transport::setup::ALPN {
+            // Raw QUIC mode — create a "fake" WebTransport session with no H3 framing.
+            let request = url::Url::parse("moqt://localhost").unwrap();
+            web_transport_quinn::Session::raw(
+                conn,
+                request,
+                web_transport_quinn::proto::ConnectResponse::default(),
+            )
+        } else {
+            anyhow::bail!("unsupported ALPN: {}", alpn)
         };
 
         Ok((session.into(), connection_id_hex))
@@ -373,7 +379,7 @@ impl Client {
 
         // TODO support connecting to both ALPNs at the same time
         config.alpn_protocols = vec![match url.scheme() {
-            "https" => web_transport_quinn::ALPN.to_vec(),
+            "https" => web_transport_quinn::ALPN.as_bytes().to_vec(),
             "moqt" => moq_transport::setup::ALPN.to_vec(),
             _ => anyhow::bail!("url scheme must be 'https' or 'moqt'"),
         }];
@@ -426,8 +432,12 @@ impl Client {
             .to_string();
 
         let session = match url.scheme() {
-            "https" => web_transport_quinn::connect_with(connection, url).await?,
-            "moqt" => connection.into(),
+            "https" => web_transport_quinn::Session::connect(connection, url.clone()).await?,
+            "moqt" => web_transport_quinn::Session::raw(
+                connection,
+                url.clone(),
+                web_transport_quinn::proto::ConnectResponse::default(),
+            ),
             _ => unreachable!(),
         };
 
@@ -459,14 +469,14 @@ impl Client {
         }
 
         // Log all DNS results for debugging
-        log::debug!(
+        tracing::debug!(
             "DNS lookup for {}, family {:?}: found {} results",
             host,
             address_family,
             addrs.len()
         );
         for (i, addr) in addrs.iter().enumerate() {
-            log::debug!(
+            tracing::debug!(
                 "  DNS[{}]: {} ({})",
                 i,
                 addr,
@@ -489,7 +499,7 @@ impl Client {
             }
             AddressFamily::Ipv6DualStack => {
                 // IPv6 socket on Linux: dual-stack, use first result
-                log::debug!(
+                tracing::debug!(
                     "Using first DNS result (Linux IPv6 dual-stack): {}",
                     addrs[0]
                 );
@@ -508,7 +518,7 @@ impl Client {
             }
         };
 
-        log::debug!(
+        tracing::debug!(
             "Connecting from {} to {} (selected from {} DNS results)",
             local_addr,
             compatible_addr,
