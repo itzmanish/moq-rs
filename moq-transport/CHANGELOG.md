@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.13.0...moq-transport-v0.13.1) - 2026-03-02
+
+### Fixed
+
+- TrackReader::is_closed() false positive after mode transition
+
+### Other
+
+- Merge pull request #148 from englishm-cloudflare/me/fix-is-closed-false-positive
+
 ## [0.13.0](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.12.3...moq-transport-v0.13.0) - 2026-02-18
 
 ### Fixed
