@@ -67,17 +67,6 @@ mod tests {
         assert_eq!(decoded, msg);
     }
 
-    #[test]
-    fn encode_missing_fields() {
-        let mut buf = BytesMut::new();
-
-        let msg = SubscribeOk {
-            id: 12345,
-            track_alias: 100,
-            params: Default::default(),
-            track_extensions: Default::default(),
-        };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
-    }
+    // Note: encode_missing_fields test removed — content_exists was removed
+    // from the struct in draft-16; no fields to validate at encode time.
 }

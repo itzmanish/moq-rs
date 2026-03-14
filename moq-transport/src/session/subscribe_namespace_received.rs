@@ -77,6 +77,7 @@ impl SubscribeNamespaceReceived {
         self.publisher.send_message(message::RequestError {
             id: self.info.request_id,
             error_code,
+            retry_interval: 0,
             reason_phrase: ReasonPhrase(reason.to_string()),
         });
 
@@ -118,6 +119,7 @@ impl Drop for SubscribeNamespaceReceived {
         self.publisher.send_message(message::RequestError {
             id: self.info.request_id,
             error_code: ServeError::NotFound.code(),
+            retry_interval: 0,
             reason_phrase: ReasonPhrase("SUBSCRIBE_NAMESPACE not handled".to_string()),
         });
     }

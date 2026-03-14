@@ -94,39 +94,4 @@ mod tests {
         let decoded = Subscribe::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
     }
-
-    #[test]
-    fn encode_missing_fields() {
-        let mut buf = BytesMut::new();
-
-        // FilterType = AbsoluteStart - missing start_location
-        let msg = Subscribe {
-            id: 12345,
-            track_namespace: TrackNamespace::from_utf8_path("test/path/to/resource"),
-            track_name: "audiotrack".to_string(),
-            params: Default::default(),
-        };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
-
-        // FilterType = AbsoluteRange - missing start_location
-        let msg = Subscribe {
-            id: 12345,
-            track_namespace: TrackNamespace::from_utf8_path("test/path/to/resource"),
-            track_name: "audiotrack".to_string(),
-            params: Default::default(),
-        };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
-
-        // FilterType = AbsoluteRange - missing end_group_id
-        let msg = Subscribe {
-            id: 12345,
-            track_namespace: TrackNamespace::from_utf8_path("test/path/to/resource"),
-            track_name: "audiotrack".to_string(),
-            params: Default::default(),
-        };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
-    }
 }

@@ -1,7 +1,7 @@
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
 
 /// Sent by the server in response to a client setup.
-/// This SERVER_SETUP message is used by moq-transport draft versions 11 and later.
+/// Draft-16: version negotiation uses ALPN; no Versions field in SERVER_SETUP.
 #[derive(Debug)]
 pub struct Server {
     /// Setup Parameters, ie: MAX_REQUEST_ID, MAX_AUTH_TOKEN_CACHE_SIZE,
@@ -72,15 +72,16 @@ mod tests {
 
         server.encode(&mut buf).unwrap();
 
+        // Draft-16: no Versions field, just Type + Length + Parameters
         #[rustfmt::skip]
         assert_eq!(
             buf.to_vec(),
             vec![
-                0x21, // Type
-                0x00, 0x0c, // Length
-                0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0E, // Version DRAFT_14 (0xff00000E)
-                0x01, // 1 Param
-                0x02, 0x43, 0xe8, // Key=2 (MaxRequestId), Value=1000
+                0x21, // Type (SERVER_SETUP)
+                0x00, 0x04, // Length = 4 bytes
+                0x01, // 1 Parameter (count)
+                // Delta=2 (MaxRequestId), Value=1000
+                0x02, 0x43, 0xe8,
             ]
         );
 

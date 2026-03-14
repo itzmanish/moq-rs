@@ -24,6 +24,7 @@ impl TrackStatusRequested {
         let status_error = message::RequestError {
             id: self.request_msg.id,
             error_code,
+            retry_interval: 0,
             reason_phrase: ReasonPhrase(error_message.to_string()),
         };
         self.publisher.send_message(status_error);

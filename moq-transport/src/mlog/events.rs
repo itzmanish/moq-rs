@@ -291,6 +291,7 @@ fn request_error_to_json(msg: &message::RequestError) -> JsonValue {
     json!({
         "request_id": msg.id,
         "error_code": msg.error_code,
+        "retry_interval": msg.retry_interval,
         "reason_phrase": &msg.reason_phrase.0,
     })
 }

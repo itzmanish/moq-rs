@@ -98,6 +98,7 @@ impl Drop for PublishNamespaceReceived {
             self.session.send_message(message::RequestError {
                 id: self.info.request_id,
                 error_code: err.code(),
+                retry_interval: 0,
                 reason_phrase: ReasonPhrase(err.to_string()),
             });
         }

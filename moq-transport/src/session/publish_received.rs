@@ -106,6 +106,7 @@ impl PublishReceived {
         self.subscriber.send_message(message::RequestError {
             id: self.info.id,
             error_code,
+            retry_interval: 0,
             reason_phrase: ReasonPhrase(reason.to_string()),
         });
 
@@ -170,6 +171,7 @@ impl Drop for PublishReceived {
         self.subscriber.send_message(message::RequestError {
             id: self.info.id,
             error_code: err.code(),
+            retry_interval: 0,
             reason_phrase: ReasonPhrase(err.to_string()),
         });
     }
