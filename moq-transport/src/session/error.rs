@@ -2,14 +2,8 @@ use crate::{coding, serve, setup};
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum SessionError {
-    #[error("webtransport session: {0}")]
-    Session(#[from] web_transport::SessionError),
-
-    #[error("webtransport write: {0}")]
-    Write(#[from] web_transport::WriteError),
-
-    #[error("webtransport read: {0}")]
-    Read(#[from] web_transport::ReadError),
+    #[error("webtransport error: {0}")]
+    WebTransport(#[from] web_transport::Error),
 
     #[error("encode error: {0}")]
     Encode(#[from] coding::EncodeError),
@@ -53,9 +47,7 @@ impl SessionError {
             // PROTOCOL_VIOLATION (0x3) - The role negotiated in the handshake was violated
             Self::RoleViolation => 0x3,
             // INTERNAL_ERROR (0x1) - Generic internal errors
-            Self::Session(_) => 0x1,
-            Self::Read(_) => 0x1,
-            Self::Write(_) => 0x1,
+            Self::WebTransport(_) => 0x1,
             Self::Encode(_) => 0x1,
             Self::BoundsExceeded(_) => 0x1,
             Self::Internal => 0x1,
