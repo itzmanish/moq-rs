@@ -101,7 +101,7 @@ impl Session {
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for
     /// MOQT control messaging.  Performs SETUP messaging and version negotiation.
     pub async fn connect(
-        mut session: web_transport::Session,
+        session: web_transport::Session,
         mlog_path: Option<PathBuf>,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         let mlog = mlog_path.and_then(|path| {
@@ -136,7 +136,7 @@ impl Session {
     /// Accepts an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for
     /// MOQT control messaging.  Performs SETUP messaging and version negotiation.
     pub async fn accept(
-        mut session: web_transport::Session,
+        session: web_transport::Session,
         mlog_path: Option<PathBuf>,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let mut mlog = mlog_path.and_then(|path| {
@@ -313,6 +313,29 @@ impl Session {
                 }
             }
 
+            // RequestOk and RequestError are bidirectional — they can be responses
+            // to requests originated by either side (e.g., PUBLISH_NAMESPACE from the
+            // publisher or SUBSCRIBE_NAMESPACE from the subscriber). We must try both
+            // handlers so the response reaches whichever side owns that request ID.
+            match &msg {
+                Message::RequestOk(_) | Message::RequestError(_) => {
+                    // Try subscriber handler first (for SUBSCRIBE_NAMESPACE responses)
+                    if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg.clone()) {
+                        if let Some(sub) = subscriber.as_mut() {
+                            let _ = sub.recv_message(pub_msg);
+                        }
+                    }
+                    // Also try publisher handler (for PUBLISH_NAMESPACE responses)
+                    if let Ok(sub_msg) = TryInto::<message::Subscriber>::try_into(msg) {
+                        if let Some(pub_) = publisher.as_mut() {
+                            let _ = pub_.recv_message(sub_msg);
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
             let msg = match TryInto::<message::Publisher>::try_into(msg) {
                 Ok(msg) => {
                     subscriber
@@ -348,7 +371,7 @@ impl Session {
     /// Will read stream header to know what type of stream it is and create
     /// the appropriate stream handlers.
     async fn run_streams(
-        mut webtransport: web_transport::Session,
+        webtransport: web_transport::Session,
         subscriber: Option<Subscriber>,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
@@ -372,7 +395,7 @@ impl Session {
 
     /// Receives QUIC datagrams and processes them using the Subscriber logic
     async fn run_datagrams(
-        mut webtransport: web_transport::Session,
+        webtransport: web_transport::Session,
         mut subscriber: Option<Subscriber>,
     ) -> Result<(), SessionError> {
         loop {
