@@ -313,6 +313,29 @@ impl Session {
                 }
             }
 
+            // RequestOk and RequestError are bidirectional — they can be responses
+            // to requests originated by either side (e.g., PUBLISH_NAMESPACE from the
+            // publisher or SUBSCRIBE_NAMESPACE from the subscriber). We must try both
+            // handlers so the response reaches whichever side owns that request ID.
+            match &msg {
+                Message::RequestOk(_) | Message::RequestError(_) => {
+                    // Try subscriber handler first (for SUBSCRIBE_NAMESPACE responses)
+                    if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg.clone()) {
+                        if let Some(sub) = subscriber.as_mut() {
+                            let _ = sub.recv_message(pub_msg);
+                        }
+                    }
+                    // Also try publisher handler (for PUBLISH_NAMESPACE responses)
+                    if let Ok(sub_msg) = TryInto::<message::Subscriber>::try_into(msg) {
+                        if let Some(pub_) = publisher.as_mut() {
+                            let _ = pub_.recv_message(sub_msg);
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
             let msg = match TryInto::<message::Publisher>::try_into(msg) {
                 Ok(msg) => {
                     subscriber
