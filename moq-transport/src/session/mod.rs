@@ -24,12 +24,31 @@ use writer::*;
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::sync::{atomic, Arc, Mutex};
 
-use crate::coding::KeyValuePairs;
+use crate::coding::{KeyValuePairs, Value};
 use crate::message::Message;
 use crate::mlog;
 use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
+
+/// The transport protocol negotiated for this MoQT connection.
+///
+/// MoQT can run over either WebTransport (HTTP/3 + QUIC) or raw QUIC.
+/// The transport type affects protocol behavior — for example, the PATH
+/// parameter is only sent in CLIENT_SETUP for raw QUIC connections,
+/// since WebTransport carries the path in the HTTP/3 CONNECT URL.
+///
+/// This enum is intentionally extensible for future transport options
+/// (e.g., QMUX, WebSocket fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// WebTransport over HTTP/3 (RFC 9220).
+    /// ALPN: "h3". Path carried in HTTP/3 CONNECT :path pseudo-header.
+    WebTransport,
+    /// Raw QUIC with MoQT framing directly on QUIC streams.
+    /// ALPN: "moq-00". Path carried in CLIENT_SETUP PATH parameter.
+    RawQuic,
+}
 
 /// Session object for managing all communications in a single QUIC connection.
 #[must_use = "run() must be called"]
@@ -49,9 +68,117 @@ pub struct Session {
     /// Optional mlog writer for MoQ Transport events
     /// Wrapped in Arc<Mutex<>> to share across send/recv tasks when enabled
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// The transport protocol negotiated for this connection.
+    transport: Transport,
+
+    /// The connection path, derived from the WebTransport URL path or CLIENT_SETUP PATH parameter.
+    /// For incoming connections: extracted during accept() from the WebTransport CONNECT URL
+    /// (takes precedence) or the CLIENT_SETUP PATH parameter (key 0x1).
+    /// For outgoing connections: auto-extracted from the session URL in connect().
+    connection_path: Option<String>,
 }
 
 impl Session {
+    const MAX_CONNECTION_PATH_LEN: usize = 1024;
+
+    /// Normalize and validate a connection path.
+    ///
+    /// Returns `Ok(None)` for empty or root-only paths. Returns `Err` for
+    /// paths that are too long, don't start with `/`, contain empty,
+    /// dot, or percent-encoded segments, or are otherwise malformed.
+    ///
+    /// Percent-encoded characters are rejected rather than decoded because
+    /// scope identity must be unambiguous: `/foo%2Fbar` and `/foo/bar`
+    /// must not silently map to different scopes, and `%2E%2E` must not
+    /// bypass the dot-segment check.
+    ///
+    /// This is used internally by `accept()` and `connect()`, but is also
+    /// available for callers that need to validate paths from other sources
+    /// (e.g., announce URLs used for forward connections).
+    pub fn normalize_connection_path(raw: &str) -> Result<Option<String>, SessionError> {
+        if raw.is_empty() || raw == "/" {
+            return Ok(None);
+        }
+
+        if raw.len() > Self::MAX_CONNECTION_PATH_LEN {
+            return Err(SessionError::InvalidPath("path too long".to_string()));
+        }
+
+        if !raw.starts_with('/') {
+            return Err(SessionError::InvalidPath(
+                "path must start with '/'".to_string(),
+            ));
+        }
+
+        let trimmed = raw.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        let mut segments = trimmed.split('/');
+        let _ = segments.next();
+        for segment in segments {
+            if segment.is_empty() {
+                return Err(SessionError::InvalidPath(
+                    "path contains empty segment".to_string(),
+                ));
+            }
+            if segment.contains('%') {
+                return Err(SessionError::InvalidPath(
+                    "path must not contain percent-encoded characters".to_string(),
+                ));
+            }
+            if segment == "." || segment == ".." {
+                return Err(SessionError::InvalidPath(
+                    "path contains invalid segment".to_string(),
+                ));
+            }
+        }
+
+        Ok(Some(trimmed.to_string()))
+    }
+
+    fn decode_client_setup_path(params: &KeyValuePairs) -> Result<Option<String>, SessionError> {
+        let Some(kvp) = params.get(setup::ParameterType::Path.into()) else {
+            return Ok(None);
+        };
+
+        let bytes = match &kvp.value {
+            Value::BytesValue(bytes) => bytes,
+            _ => {
+                return Err(SessionError::InvalidPath(
+                    "PATH parameter must be bytes-encoded".to_string(),
+                ))
+            }
+        };
+
+        if bytes.len() > Self::MAX_CONNECTION_PATH_LEN {
+            return Err(SessionError::InvalidPath("path too long".to_string()));
+        }
+
+        let path = std::str::from_utf8(bytes)
+            .map_err(|_| SessionError::InvalidPath("path must be UTF-8".to_string()))?;
+
+        Self::normalize_connection_path(path)
+    }
+
+    /// Returns the negotiated transport protocol for this connection.
+    pub fn transport(&self) -> Transport {
+        self.transport
+    }
+
+    /// Returns the connection path, if one was present on the incoming connection.
+    ///
+    /// For server-side sessions (created via `accept()`), this is derived from:
+    /// 1. The WebTransport CONNECT URL path (takes precedence), or
+    /// 2. The CLIENT_SETUP PATH parameter (key 0x1), used for raw QUIC connections.
+    ///
+    /// Returns `None` if no path was present or if the path was just "/".
+    pub fn connection_path(&self) -> Option<&str> {
+        self.connection_path.as_deref()
+    }
+
     // Helper for determining the largest supported version
     fn largest_common<T: Ord + Clone + Eq>(a: &[T], b: &[T]) -> Option<T> {
         a.iter()
@@ -359,6 +486,8 @@ impl Session {
         recver: Reader,
         first_requestid: u64,
         mlog: Option<mlog::MlogWriter>,
+        transport: Transport,
+        connection_path: Option<String>,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let next_requestid = Arc::new(atomic::AtomicU64::new(first_requestid));
         let outgoing = Queue::default().split();
@@ -386,6 +515,8 @@ impl Session {
             subscriber: subscriber.clone(),
             outgoing: outgoing.1,
             mlog: mlog_shared,
+            transport,
+            connection_path,
         };
 
         (session, publisher, subscriber)
@@ -393,10 +524,22 @@ impl Session {
 
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for
     /// MOQT control messaging.  Performs SETUP messaging and version negotiation.
+    ///
+    /// If the session URL contains a non-trivial path (not empty or "/"), the PATH
+    /// parameter (key 0x1) is automatically sent in CLIENT_SETUP. This propagates
+    /// the connection path (App ID / MoQT scope) to the remote peer, which is needed
+    /// for relay-to-relay connections. To connect without sending PATH, use a URL
+    /// with no path component.
     pub async fn connect(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
+        transport: Transport,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        // Auto-extract path from the session URL.
+        // This aligns with the unified moqt:// URI scheme direction (IETF PR #1486)
+        // where the path is always part of the URI regardless of transport.
+        let url_path = session.url().path();
+        let path = Self::normalize_connection_path(url_path)?;
         let mlog = mlog_path.and_then(|path| {
             mlog::MlogWriter::new(path)
                 .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
@@ -412,6 +555,14 @@ impl Session {
         let mut params = KeyValuePairs::default();
         params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
 
+        // Only send PATH in CLIENT_SETUP for raw QUIC connections.
+        // For WebTransport, the path is already carried in the HTTP/3 CONNECT URL.
+        if let Some(ref path) = path {
+            if transport == Transport::RawQuic {
+                params.set_bytesvalue(setup::ParameterType::Path.into(), path.as_bytes().to_vec());
+            }
+        }
+
         let client = setup::Client {
             versions: versions.clone(),
             params,
@@ -422,6 +573,8 @@ impl Session {
             direction = "sent",
             msg_type = "CLIENT_SETUP",
             versions = ?client.versions,
+            ?transport,
+            path = path.as_deref(),
             "MoQT control message"
         );
         sender.encode(&client).await?;
@@ -440,7 +593,7 @@ impl Session {
         // TODO: emit server_setup_parsed event
 
         // We are the client, so the first request id is 0
-        let session = Session::new(session, sender, recver, 0, mlog);
+        let session = Session::new(session, sender, recver, 0, mlog, transport, path);
         Ok((session.0, session.1.unwrap(), session.2.unwrap()))
     }
 
@@ -449,6 +602,7 @@ impl Session {
     pub async fn accept(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
+        transport: Transport,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let mut mlog = mlog_path.and_then(|path| {
             mlog::MlogWriter::new(path)
@@ -467,6 +621,32 @@ impl Session {
             versions = ?client.versions,
             "MoQT control message"
         );
+
+        // Extract WebTransport URL path from the underlying session.
+        // For WebTransport connections, this comes from the HTTP/3 CONNECT :path.
+        // For raw QUIC, this is the placeholder URL ("moqt://localhost") and has no meaningful path.
+        let wt_url_path = session.url().path();
+        let wt_path = Self::normalize_connection_path(wt_url_path)?;
+
+        // Extract CLIENT_SETUP PATH parameter (key 0x1, BytesValue).
+        // Used for raw QUIC connections where there's no HTTP CONNECT URL.
+        let client_setup_path = if wt_path.is_none() {
+            Self::decode_client_setup_path(&client.params)?
+        } else {
+            None
+        };
+
+        // Combine: WebTransport URL path takes precedence over CLIENT_SETUP PATH.
+        // WebTransport connections always have the path in the CONNECT URL.
+        // Raw QUIC connections only have CLIENT_SETUP PATH.
+        let connection_path = wt_path.or(client_setup_path);
+
+        if connection_path.is_some() {
+            tracing::debug!(
+                connection_path = connection_path.as_deref(),
+                "Connection path resolved"
+            );
+        }
 
         // Emit mlog event for CLIENT_SETUP parsed
         if let Some(ref mut mlog) = mlog {
@@ -505,7 +685,15 @@ impl Session {
             sender.encode(&server).await?;
 
             // We are the server, so the first request id is 1
-            Ok(Session::new(session, sender, recver, 1, mlog))
+            Ok(Session::new(
+                session,
+                sender,
+                recver,
+                1,
+                mlog,
+                transport,
+                connection_path,
+            ))
         } else {
             Err(SessionError::Version(client.versions, server_versions))
         }
@@ -708,5 +896,80 @@ impl Session {
                 .recv_datagram(datagram)
                 .await?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // normalize_connection_path
+    // ========================================================================
+
+    #[test]
+    fn normalize_empty_and_root() {
+        assert_eq!(Session::normalize_connection_path("").unwrap(), None);
+        assert_eq!(Session::normalize_connection_path("/").unwrap(), None);
+        assert_eq!(Session::normalize_connection_path("///").unwrap(), None);
+    }
+
+    #[test]
+    fn normalize_valid_paths() {
+        assert_eq!(
+            Session::normalize_connection_path("/app").unwrap(),
+            Some("/app".to_string())
+        );
+        assert_eq!(
+            Session::normalize_connection_path("/tenant/stream-1").unwrap(),
+            Some("/tenant/stream-1".to_string())
+        );
+        // Trailing slash is trimmed
+        assert_eq!(
+            Session::normalize_connection_path("/app/").unwrap(),
+            Some("/app".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_missing_leading_slash() {
+        assert!(Session::normalize_connection_path("app").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_empty_segments() {
+        assert!(Session::normalize_connection_path("/app//stream").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_dot_segments() {
+        assert!(Session::normalize_connection_path("/app/./stream").is_err());
+        assert!(Session::normalize_connection_path("/app/../secret").is_err());
+        assert!(Session::normalize_connection_path("/..").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_percent_encoded_characters() {
+        // %2F = '/' — would create scope ambiguity
+        assert!(Session::normalize_connection_path("/foo%2Fbar").is_err());
+        // %2E%2E = '..' — would bypass dot-segment check
+        assert!(Session::normalize_connection_path("/%2E%2E/secret").is_err());
+        // %00 = null — general injection risk
+        assert!(Session::normalize_connection_path("/app/%00").is_err());
+        // Uppercase hex digits
+        assert!(Session::normalize_connection_path("/app/%2e%2e").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_too_long_path() {
+        let long_path = format!("/{}", "a".repeat(Session::MAX_CONNECTION_PATH_LEN));
+        assert!(Session::normalize_connection_path(&long_path).is_err());
+    }
+
+    #[test]
+    fn normalize_accepts_max_length_path() {
+        // Exactly at the limit (1024 total including leading slash)
+        let path = format!("/{}", "a".repeat(Session::MAX_CONNECTION_PATH_LEN - 1));
+        assert!(Session::normalize_connection_path(&path).is_ok());
     }
 }

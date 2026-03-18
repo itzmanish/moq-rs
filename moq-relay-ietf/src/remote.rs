@@ -235,23 +235,24 @@ impl RemoteProducer {
             &self.quic
         };
         // TODO reuse QUIC and MoQ sessions
-        let (session, _quic_client_initial_cid) = match client.connect(&self.url, self.addr).await {
-            Ok(session) => session,
-            Err(err) => {
-                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
-                    .increment(1);
-                return Err(err);
-            }
-        };
-        let (session, subscriber) = match moq_transport::session::Subscriber::connect(session).await
-        {
-            Ok(session) => session,
-            Err(err) => {
-                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
-                    .increment(1);
-                return Err(err.into());
-            }
-        };
+        let (session, _quic_client_initial_cid, transport) =
+            match client.connect(&self.url, self.addr).await {
+                Ok(session) => session,
+                Err(err) => {
+                    metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
+                        .increment(1);
+                    return Err(err);
+                }
+            };
+        let (session, subscriber) =
+            match moq_transport::session::Subscriber::connect(session, transport).await {
+                Ok(session) => session,
+                Err(err) => {
+                    metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
+                        .increment(1);
+                    return Err(err.into());
+                }
+            };
 
         // Track established upstream connections - decrements when this function returns.
         // Placed after successful connect + session setup so the gauge only reflects

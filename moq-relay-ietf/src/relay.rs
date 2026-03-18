@@ -16,7 +16,11 @@ type ServerFuture = Pin<
     Box<
         dyn Future<
             Output = (
-                anyhow::Result<(web_transport::Session, String)>,
+                anyhow::Result<(
+                    web_transport::Session,
+                    String,
+                    moq_transport::session::Transport,
+                )>,
                 quic::Server,
             ),
         >,
@@ -133,7 +137,7 @@ impl Relay {
             tracing::info!("forwarding announces to {}", url);
 
             // Establish a QUIC connection to the forward URL
-            let (session, _quic_client_initial_cid) = self.quic_endpoints[0]
+            let (session, _quic_client_initial_cid, transport) = self.quic_endpoints[0]
                 .client
                 .connect(url, None)
                 .await
@@ -141,7 +145,7 @@ impl Relay {
 
             // Create the MoQ session over the connection
             let (session, publisher, subscriber) =
-                moq_transport::session::Session::connect(session, None)
+                moq_transport::session::Session::connect(session, None, transport)
                     .await
                     .context("failed to establish forward session")?;
 
@@ -210,7 +214,7 @@ impl Relay {
                         .boxed(),
                     );
 
-                    let (conn, connection_id) = conn_result.context("failed to accept QUIC connection")?;
+                    let (conn, connection_id, transport) = conn_result.context("failed to accept QUIC connection")?;
 
                     metrics::counter!("moq_relay_connections_total").increment(1);
 
@@ -229,7 +233,7 @@ impl Relay {
                         let _conn_guard = GaugeGuard::new("moq_relay_active_connections");
 
                         // Create the MoQ session over the connection (setup handshake etc)
-                        let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path).await {
+                        let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path, transport).await {
                             Ok(session) => session,
                             Err(err) => {
                                 tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);
