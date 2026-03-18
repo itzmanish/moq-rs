@@ -122,6 +122,57 @@ impl NamespaceOrigin {
     }
 }
 
+/// Information about the resolved scope for a connection.
+///
+/// Returned by [`Coordinator::resolve_scope()`] to tell the relay:
+/// - Which scope this connection belongs to (for routing and namespace isolation)
+/// - What the connection is allowed to do (for permission enforcement)
+///
+/// Multiple connection paths can map to the same `scope_id` — for example,
+/// a publisher path and a subscriber path that share a scope but have
+/// different permissions.
+#[derive(Debug, Clone)]
+pub struct ScopeInfo {
+    /// The resolved scope identity. Used as the key for namespace
+    /// registration and lookup in all subsequent coordinator operations.
+    ///
+    /// Multiple connection paths can map to the same `scope_id`.
+    pub scope_id: String,
+
+    /// What this connection is allowed to do within the scope.
+    pub permissions: ScopePermissions,
+}
+
+/// Permissions granted to a connection within its scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopePermissions {
+    /// Can both publish (PUBLISH_NAMESPACE) and subscribe (SUBSCRIBE/FETCH).
+    ReadWrite,
+    /// Can subscribe/fetch only. Publishing attempts will be rejected
+    /// by the relay (the Consumer side of the session will not be created).
+    ReadOnly,
+}
+
+impl ScopePermissions {
+    /// Whether this permission level allows publishing (PUBLISH_NAMESPACE).
+    pub fn can_publish(&self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
+
+    /// Whether this permission level allows subscribing (SUBSCRIBE/FETCH).
+    ///
+    /// Always returns `true` — both `ReadWrite` and `ReadOnly` connections
+    /// can subscribe. This is intentional: the asymmetry with [`can_publish()`]
+    /// reflects that subscribing is the baseline capability, while publishing
+    /// requires elevated permissions. If a future permission level needs to
+    /// deny subscribing, a new variant should be added.
+    ///
+    /// [`can_publish()`]: ScopePermissions::can_publish
+    pub fn can_subscribe(&self) -> bool {
+        true
+    }
+}
+
 /// Coordinator handles namespace registration/discovery across relays.
 ///
 /// Implementations are responsible for:
@@ -137,6 +188,43 @@ impl NamespaceOrigin {
 /// Multiple tasks will call these methods concurrently.
 #[async_trait]
 pub trait Coordinator: Send + Sync {
+    /// Resolve a connection path to scope information.
+    ///
+    /// Called once per accepted session, before any register/lookup calls.
+    /// The relay uses the returned [`ScopeInfo`] to:
+    /// - Scope all subsequent coordinator operations to `scope_id`
+    /// - Enforce permissions (e.g., skip creating the publish side for
+    ///   `ReadOnly` connections)
+    ///
+    /// # Arguments
+    ///
+    /// * `connection_path` - The raw connection path from the WebTransport
+    ///   URL or CLIENT_SETUP PATH parameter. `None` if no path was present.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(ScopeInfo))` - Connection is scoped with the given
+    ///   identity and permissions.
+    /// - `Ok(None)` - Connection is unscoped. The relay will pass
+    ///   `scope: None` to all subsequent coordinator calls and allow
+    ///   both publish and subscribe.
+    /// - `Err(...)` - Connection should be rejected (e.g., unrecognized
+    ///   path, unauthorized).
+    ///
+    /// # Default Implementation
+    ///
+    /// Passes through the connection path as the `scope_id` with
+    /// `ReadWrite` permissions. Connections without a path are unscoped.
+    async fn resolve_scope(
+        &self,
+        connection_path: Option<&str>,
+    ) -> CoordinatorResult<Option<ScopeInfo>> {
+        Ok(connection_path.map(|path| ScopeInfo {
+            scope_id: path.to_string(),
+            permissions: ScopePermissions::ReadWrite,
+        }))
+    }
+
     /// Register a namespace as locally available on this relay.
     ///
     /// Called when a publisher sends PUBLISH_NAMESPACE.

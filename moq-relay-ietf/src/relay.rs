@@ -248,6 +248,10 @@ impl Relay {
                         // Track active connections - decrements when task completes
                         let _conn_guard = GaugeGuard::new("moq_relay_active_connections");
 
+                        // Clone the raw connection so we can close it with a proper
+                        // error code if scope resolution fails after the MoQ handshake.
+                        let raw_conn = conn.clone();
+
                         // Create the MoQ session over the connection (setup handshake etc)
                         let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path, transport).await {
                             Ok(session) => session,
@@ -263,15 +267,63 @@ impl Relay {
                         // Create our MoQ relay session
                         let moq_session = session;
 
-                        // Use the connection path as the scope identity for this session.
-                        // The connection_path was already validated and normalized during
-                        // Session::accept() — it's safe to use directly as a scope key.
-                        let scope = moq_session.connection_path().map(|s| s.to_string());
+                        // Resolve the connection path to a scope (identity + permissions).
+                        // This translates the raw transport-level path into an application-level
+                        // scope_id and determines what the connection is allowed to do.
+                        let scope_info = match coordinator.resolve_scope(moq_session.connection_path()).await {
+                            Ok(info) => info,
+                            Err(err) => {
+                                tracing::warn!(
+                                    connection_path = moq_session.connection_path(),
+                                    error = %err,
+                                    "scope resolution failed, rejecting session"
+                                );
+                                // Close with PROTOCOL_VIOLATION (0x3) so the client
+                                // gets a meaningful error instead of an abrupt reset.
+                                // This is a QUIC APPLICATION_CLOSE, not a MoQT SESSION_CLOSE
+                                // control message. Sending a proper SESSION_CLOSE would require
+                                // running the MoQ session's send loop, which is not warranted
+                                // for a pre-session rejection. The QUIC close code and reason
+                                // string are visible to the client's transport layer.
+                                raw_conn.close(0x3, "scope resolution failed");
+                                metrics::counter!("moq_relay_connection_errors_total", "stage" => "scope_resolve").increment(1);
+                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                return Ok(());
+                            }
+                        };
 
+                        let scope_id = scope_info.as_ref().map(|s| s.scope_id.clone());
+                        let can_publish = scope_info.as_ref().is_none_or(|s| s.permissions.can_publish());
+                        let can_subscribe = scope_info.as_ref().is_none_or(|s| s.permissions.can_subscribe());
+
+                        if let Some(ref info) = scope_info {
+                            tracing::debug!(
+                                connection_path = moq_session.connection_path(),
+                                scope_id = %info.scope_id,
+                                permissions = ?info.permissions,
+                                "scope resolved"
+                            );
+                        }
+
+                        // Gate Producer/Consumer creation on permissions.
+                        // Note the intentional inversion:
+                        // - Producer serves SUBSCRIBEs → gated on can_subscribe
+                        // - Consumer handles PUBLISH_NAMESPACEs → gated on can_publish
                         let session = Session {
                             session: moq_session,
-                            producer: publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, scope.clone())),
-                            consumer: subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope)),
+                            // Currently always true — can_subscribe() returns true for
+                            // both ReadWrite and ReadOnly. The guard is forward-looking
+                            // for a potential future WriteOnly variant.
+                            producer: if can_subscribe {
+                                publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, scope_id.clone()))
+                            } else {
+                                None
+                            },
+                            consumer: if can_publish {
+                                subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope_id))
+                            } else {
+                                None
+                            },
                         };
 
                         match session.run().await {
