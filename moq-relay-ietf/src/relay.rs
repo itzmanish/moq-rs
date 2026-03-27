@@ -180,6 +180,10 @@ impl Relay {
                     None,
                     forward_scope,
                 )),
+                // Forward connections are always full read-write relay peers,
+                // so no reject loops needed.
+                reject_publishes: None,
+                reject_subscribes: None,
             };
 
             let forward_producer = session.producer.clone();
@@ -309,21 +313,28 @@ impl Relay {
                         // Note the intentional inversion:
                         // - Producer serves SUBSCRIBEs → gated on can_subscribe
                         // - Consumer handles PUBLISH_NAMESPACEs → gated on can_publish
+                        //
+                        // When a half is disabled, we pass its transport counterpart
+                        // to the Session's reject fields so unauthorized messages get
+                        // an explicit error response instead of being silently ignored.
+                        let (producer, reject_subscribes) = if can_subscribe {
+                            (publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, scope_id.clone())), None)
+                        } else {
+                            (None, publisher)
+                        };
+
+                        let (consumer, reject_publishes) = if can_publish {
+                            (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope_id)), None)
+                        } else {
+                            (None, subscriber)
+                        };
+
                         let session = Session {
                             session: moq_session,
-                            // Currently always true — can_subscribe() returns true for
-                            // both ReadWrite and ReadOnly. The guard is forward-looking
-                            // for a potential future WriteOnly variant.
-                            producer: if can_subscribe {
-                                publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, scope_id.clone()))
-                            } else {
-                                None
-                            },
-                            consumer: if can_publish {
-                                subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope_id))
-                            } else {
-                                None
-                            },
+                            producer,
+                            consumer,
+                            reject_publishes,
+                            reject_subscribes,
                         };
 
                         match session.run().await {
