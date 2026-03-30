@@ -7,11 +7,12 @@
 //! The reader can be cloned, in which case each reader receives a copy of each object. (fanout)
 //!
 //! The stream is closed with [ServeError::Closed] when all writers or readers are dropped.
-use std::{cmp, ops::Deref, sync::Arc};
+use std::{ops::Deref, sync::Arc};
 
 use bytes::Bytes;
 
 use crate::data::ObjectStatus;
+use crate::serve::{GroupCache, GroupCacheReader, GroupCacheWriter};
 use crate::watch::State;
 
 use super::{ServeError, Track};
@@ -22,10 +23,18 @@ pub struct Subgroups {
 
 impl Subgroups {
     pub fn produce(self) -> (SubgroupsWriter, SubgroupsReader) {
-        let (writer, reader) = State::default().split();
+        self.produce_with_cache(DEFAULT_MAX_CACHED_GROUPS)
+    }
 
-        let writer = SubgroupsWriter::new(writer, self.track.clone());
-        let reader = SubgroupsReader::new(reader, self.track);
+    pub fn produce_with_cache(
+        self,
+        max_cached_groups: usize,
+    ) -> (SubgroupsWriter, SubgroupsReader) {
+        let (cache_writer, cache_reader) =
+            GroupCache::produce(self.track.clone(), max_cached_groups);
+
+        let writer = SubgroupsWriter::new(cache_writer, self.track.clone());
+        let reader = SubgroupsReader::new(cache_reader, self.track);
 
         (writer, reader)
     }
@@ -39,39 +48,26 @@ impl Deref for Subgroups {
     }
 }
 
-// State shared between the writer and reader.
-struct SubgroupsState {
-    latest_subgroup_reader: Option<SubgroupReader>,
-    epoch: u64, // Updated each time latest changes
-    closed: Result<(), ServeError>,
-}
-
-impl Default for SubgroupsState {
-    fn default() -> Self {
-        Self {
-            latest_subgroup_reader: None,
-            epoch: 0,
-            closed: Ok(()),
-        }
-    }
-}
+const DEFAULT_MAX_CACHED_GROUPS: usize = 16;
 
 pub struct SubgroupsWriter {
     pub info: Arc<Track>,
-    state: State<SubgroupsState>,
+    cache: GroupCacheWriter,
     next_subgroup_id: u64, // Not in the state to avoid a lock
     next_group_id: u64,    // Not in the state to avoid a lock
     last_group_id: u64,    // Not in the state to avoid a lock
+    has_last_group: bool,
 }
 
 impl SubgroupsWriter {
-    fn new(state: State<SubgroupsState>, track: Arc<Track>) -> Self {
+    fn new(cache: GroupCacheWriter, track: Arc<Track>) -> Self {
         Self {
             info: track,
-            state,
+            cache,
             next_subgroup_id: 0,
             next_group_id: 0,
             last_group_id: 0,
+            has_last_group: false,
         }
     }
 
@@ -100,50 +96,29 @@ impl SubgroupsWriter {
 
     /// Create a new subgroup with the given parameters, inserting it into the track.
     pub fn create(&mut self, subgroup: Subgroup) -> Result<SubgroupWriter, ServeError> {
-        let subgroup = SubgroupInfo {
-            track: self.info.clone(),
-            group_id: subgroup.group_id,
-            subgroup_id: subgroup.subgroup_id,
-            priority: subgroup.priority,
-        };
-        let (writer, reader) = subgroup.produce();
-
-        let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
-
-        if let Some(latest) = &state.latest_subgroup_reader {
-            // TODO: Check this logic again
-            if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Equal {
-                match writer.subgroup_id.cmp(&latest.subgroup_id) {
-                    cmp::Ordering::Less => return Ok(writer), // dropped immediately, lul
-                    cmp::Ordering::Equal => return Err(ServeError::Duplicate),
-                    cmp::Ordering::Greater => state.latest_subgroup_reader = Some(reader),
-                }
-            } else if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Greater {
-                state.latest_subgroup_reader = Some(reader);
-            } else {
-                return Ok(writer); // drop here as well
-            }
-        } else {
-            state.latest_subgroup_reader = Some(reader);
+        if self.has_last_group
+            && subgroup.group_id == self.last_group_id
+            && self.next_subgroup_id != 0
+            && subgroup.subgroup_id == self.next_subgroup_id - 1
+        {
+            return Err(ServeError::Duplicate);
         }
 
-        self.next_subgroup_id = state.latest_subgroup_reader.as_ref().unwrap().subgroup_id + 1;
-        self.next_group_id = state.latest_subgroup_reader.as_ref().unwrap().group_id + 1;
-        self.last_group_id = state.latest_subgroup_reader.as_ref().unwrap().group_id;
-        state.epoch += 1;
+        let (writer, inserted) = self.cache.insert(subgroup.clone())?;
+
+        if inserted {
+            self.has_last_group = true;
+            self.last_group_id = subgroup.group_id;
+            self.next_group_id = subgroup.group_id + 1;
+            self.next_subgroup_id = subgroup.subgroup_id + 1;
+        }
 
         Ok(writer)
     }
 
     /// Close the segment with an error.
     pub fn close(self, err: ServeError) -> Result<(), ServeError> {
-        let state = self.state.lock();
-        state.closed.clone()?;
-
-        let mut state = state.into_mut().ok_or(ServeError::Cancel)?;
-        state.closed = Err(err);
-
-        Ok(())
+        self.cache.close(err)
     }
 }
 
@@ -158,46 +133,43 @@ impl Deref for SubgroupsWriter {
 #[derive(Clone)]
 pub struct SubgroupsReader {
     pub info: Arc<Track>,
-    state: State<SubgroupsState>,
-    epoch: u64,
+    cache: GroupCacheReader,
 }
 
 impl SubgroupsReader {
-    fn new(state: State<SubgroupsState>, track_info: Arc<Track>) -> Self {
+    fn new(cache: GroupCacheReader, track_info: Arc<Track>) -> Self {
         Self {
             info: track_info,
-            state,
-            epoch: 0,
+            cache,
         }
     }
 
     pub async fn next(&mut self) -> Result<Option<SubgroupReader>, ServeError> {
-        loop {
-            {
-                let state = self.state.lock();
-
-                if self.epoch != state.epoch {
-                    self.epoch = state.epoch;
-                    return Ok(state.latest_subgroup_reader.clone());
-                }
-
-                state.closed.clone()?;
-                match state.modified() {
-                    Some(notify) => notify,
-                    None => return Ok(None),
-                }
-            }
-            .await; // Try again when the state changes
-        }
+        self.cache.next().await
     }
 
     // Returns the largest group/sequence
     pub fn latest(&self) -> Option<(u64, u64)> {
-        let state = self.state.lock();
-        state
-            .latest_subgroup_reader
-            .as_ref()
-            .map(|group| (group.group_id, group.latest()))
+        self.cache.latest_group()
+    }
+
+    pub fn rewind_from(&self, start_group_id: u64) -> Self {
+        Self {
+            info: self.info.clone(),
+            cache: self.cache.reader_from(start_group_id),
+        }
+    }
+
+    pub fn available_rewind_groups(&self) -> u64 {
+        self.cache.available_groups()
+    }
+
+    pub fn has_group(&self, group_id: u64) -> bool {
+        self.cache.has_group(group_id)
+    }
+
+    pub fn oldest_group(&self) -> Option<u64> {
+        self.cache.oldest_group()
     }
 }
 
