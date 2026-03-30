@@ -94,7 +94,6 @@ impl SubgroupsWriter {
         })
     }
 
-    /// Create a new subgroup with the given parameters, inserting it into the track.
     pub fn create(&mut self, subgroup: Subgroup) -> Result<SubgroupWriter, ServeError> {
         if self.has_last_group
             && subgroup.group_id == self.last_group_id
@@ -159,7 +158,6 @@ impl SubgroupsReader {
             cache: self.cache.reader_from(start_group_id),
         }
     }
-
     pub fn available_rewind_groups(&self) -> u64 {
         self.cache.available_groups()
     }
@@ -597,5 +595,151 @@ impl Deref for SubgroupObjectReader {
 
     fn deref(&self) -> &Self::Target {
         &self.info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coding::TrackNamespace;
+
+    fn make_track() -> Arc<Track> {
+        Arc::new(Track::new(
+            TrackNamespace::from_utf8_path("test/ns"),
+            "video".to_string(),
+        ))
+    }
+
+    fn write_group(writer: &mut SubgroupsWriter, group_id: u64) -> SubgroupWriter {
+        writer
+            .create(Subgroup {
+                group_id,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn forward_reader_receives_new_groups() {
+        let track = make_track();
+        let (mut writer, mut reader) = Subgroups { track }.produce();
+
+        let _w0 = write_group(&mut writer, 0);
+        let _w1 = write_group(&mut writer, 1);
+
+        let g = reader.next().await.unwrap().unwrap();
+        assert_eq!(g.group_id, 0);
+
+        let g = reader.next().await.unwrap().unwrap();
+        assert_eq!(g.group_id, 1);
+    }
+
+    #[tokio::test]
+    async fn rewind_reader_starts_from_past_group() {
+        let track = make_track();
+        let (mut writer, reader) = Subgroups { track }.produce();
+
+        let _w0 = write_group(&mut writer, 0);
+        let _w1 = write_group(&mut writer, 1);
+        let _w2 = write_group(&mut writer, 2);
+        let _w3 = write_group(&mut writer, 3);
+
+        let mut rewound = reader.rewind_from(1);
+
+        let g = rewound.next().await.unwrap().unwrap();
+        assert_eq!(g.group_id, 1);
+
+        let g = rewound.next().await.unwrap().unwrap();
+        assert_eq!(g.group_id, 2);
+
+        let g = rewound.next().await.unwrap().unwrap();
+        assert_eq!(g.group_id, 3);
+    }
+
+    #[tokio::test]
+    async fn cache_eviction_drops_oldest() {
+        let track = make_track();
+        let (mut writer, reader) = Subgroups { track }.produce_with_cache(3);
+
+        let _w0 = write_group(&mut writer, 0);
+        let _w1 = write_group(&mut writer, 1);
+        let _w2 = write_group(&mut writer, 2);
+        let _w3 = write_group(&mut writer, 3);
+
+        assert!(!reader.has_group(0));
+        assert!(reader.has_group(1));
+        assert!(reader.has_group(2));
+        assert!(reader.has_group(3));
+        assert_eq!(reader.oldest_group(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn available_rewind_groups_count() {
+        let track = make_track();
+        let (mut writer, reader) = Subgroups { track }.produce();
+
+        assert_eq!(reader.available_rewind_groups(), 0);
+
+        let _w0 = write_group(&mut writer, 0);
+        assert_eq!(reader.available_rewind_groups(), 0);
+
+        let _w1 = write_group(&mut writer, 1);
+        assert_eq!(reader.available_rewind_groups(), 1);
+
+        let _w2 = write_group(&mut writer, 2);
+        assert_eq!(reader.available_rewind_groups(), 2);
+    }
+
+    #[tokio::test]
+    async fn rewind_and_forward_readers_independent() {
+        let track = make_track();
+        let (mut writer, mut forward_reader) = Subgroups { track }.produce();
+
+        let _w0 = write_group(&mut writer, 0);
+        let _w1 = write_group(&mut writer, 1);
+        let _w2 = write_group(&mut writer, 2);
+
+        let mut rewind_reader = forward_reader.rewind_from(0);
+
+        let fg = forward_reader.next().await.unwrap().unwrap();
+        assert_eq!(fg.group_id, 0);
+
+        let rg = rewind_reader.next().await.unwrap().unwrap();
+        assert_eq!(rg.group_id, 0);
+
+        let fg = forward_reader.next().await.unwrap().unwrap();
+        assert_eq!(fg.group_id, 1);
+
+        let rg = rewind_reader.next().await.unwrap().unwrap();
+        assert_eq!(rg.group_id, 1);
+    }
+
+    #[test]
+    fn duplicate_group_id_returns_error() {
+        let track = make_track();
+        let (mut writer, _reader) = Subgroups { track }.produce();
+
+        let _w0 = write_group(&mut writer, 0);
+        let result = writer.create(Subgroup {
+            group_id: 0,
+            subgroup_id: 0,
+            priority: 0,
+        });
+        assert!(matches!(result, Err(ServeError::Duplicate)));
+    }
+
+    #[test]
+    fn stale_group_id_silently_accepted() {
+        let track = make_track();
+        let (mut writer, _reader) = Subgroups { track }.produce();
+
+        let _w1 = write_group(&mut writer, 1);
+        let result = writer.create(Subgroup {
+            group_id: 0,
+            subgroup_id: 0,
+            priority: 0,
+        });
+        assert!(result.is_ok());
     }
 }
