@@ -615,6 +615,8 @@ mod tests {
             assert_eq!(*gid, 0);
             assert_eq!(data, &payload(0, *oid));
         }
+    }
+
     /// Test that a track is NOT considered stale after the writer transitions to
     /// subgroups mode. This is the core regression: TrackWriter::subgroups()
     /// consumes self, dropping the Track-level State, but the SubgroupsWriter
