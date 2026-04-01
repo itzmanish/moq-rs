@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.11](https://github.com/cloudflare/moq-rs/compare/moq-pub-v0.8.10...moq-pub-v0.8.11) - 2026-03-27
+
+### Added
+
+- add Transport enum and connection path extraction
+
+### Fixed
+
+- *(moq-pub)* combine moof+mdat into single MoQ Object
+
 ## [0.8.10](https://github.com/cloudflare/moq-rs/compare/moq-pub-v0.8.9...moq-pub-v0.8.10) - 2026-02-18
 
 ### Other

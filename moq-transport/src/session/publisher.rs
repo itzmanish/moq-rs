@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::{
     collections::{hash_map, HashMap},
     sync::{atomic, Arc, Mutex},
@@ -74,15 +78,17 @@ impl Publisher {
 
     pub async fn accept(
         session: web_transport::Session,
+        transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) = Session::accept(session, None).await?;
+        let (session, publisher, _) = Session::accept(session, None, transport).await?;
         Ok((session, publisher.unwrap()))
     }
 
     pub async fn connect(
         session: web_transport::Session,
+        transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) = Session::connect(session, None).await?;
+        let (session, publisher, _) = Session::connect(session, None, transport).await?;
         Ok((session, publisher))
     }
 

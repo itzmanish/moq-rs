@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "moq-native-ietf"
 description = "Media over QUIC - Helper library for native applications"
@@ -5,14 +8,14 @@ authors = ["Luke Curley"]
 repository = "https://github.com/englishm/moq-rs"
 license = "MIT OR Apache-2.0"
 
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]
 categories = ["multimedia", "network-programming", "web-programming"]
 
 [dependencies]
-moq-transport = { path = "../moq-transport", version = "0.13" }
+moq-transport = { path = "../moq-transport", version = "0.14" }
 web-transport = { workspace = true }
 web-transport-quinn = { version = "0.11", default-features = false, features = ["ring"] }
 

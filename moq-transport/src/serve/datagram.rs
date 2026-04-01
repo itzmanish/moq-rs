@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::{fmt, sync::Arc};
 
 use crate::watch::State;
@@ -113,6 +117,12 @@ impl DatagramsReader {
             .latest
             .as_ref()
             .map(|datagram| (datagram.group_id, datagram.object_id))
+    }
+
+    /// Check if the datagrams writer has been closed or dropped.
+    pub fn is_closed(&self) -> bool {
+        let state = self.state.lock();
+        state.closed.is_err() || state.modified().is_none()
     }
 }
 

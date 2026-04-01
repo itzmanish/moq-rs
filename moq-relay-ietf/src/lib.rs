@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! MoQ Relay library for building Media over QUIC relay servers.
 //!
 //! This crate provides the core relay functionality that can be embedded

@@ -1,11 +1,14 @@
+# SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "moq-test-client"
 description = "MoQT Interop Test Client - A standardized test client for interoperability testing"
-authors = []
+authors = ["moq-rs contributors"]
 repository = "https://github.com/cloudflare/moq-rs"
 license = "MIT OR Apache-2.0"
 
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 
 keywords = ["quic", "webtransport", "moqt", "testing", "interop"]
@@ -16,7 +19,7 @@ name = "moq-test-client"
 path = "src/main.rs"
 
 [dependencies]
-moq-transport = { path = "../moq-transport", version = "0.13" }
+moq-transport = { path = "../moq-transport", version = "0.14" }
 moq-native-ietf = { path = "../moq-native-ietf", version = "0.7" }
 web-transport = { workspace = true }
 

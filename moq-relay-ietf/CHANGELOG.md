@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.13](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.12...moq-relay-ietf-v0.7.13) - 2026-03-27
+
+### Added
+
+- actively reject unauthorized control messages on permission-gated sessions
+- add scope-aware namespace isolation to ApiCoordinator
+- add Coordinator stubs for SUBSCRIBE_NAMESPACE, track PUBLISH, and lingering subscriber support
+- add resolve_scope() to Coordinator trait with permission-gated sessions
+- add scope parameter to Coordinator trait and thread through relay
+- add Transport enum and connection path extraction
+
 ## [0.7.12](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.11...moq-relay-ietf-v0.7.12) - 2026-02-18
 
 ### Other

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::collections::HashMap;
 
 use std::collections::VecDeque;
@@ -131,12 +134,16 @@ impl RemotesConsumer {
     }
 
     /// Route to a remote origin based on the namespace.
+    ///
+    /// `scope` is the resolved scope identity (from `Coordinator::resolve_scope()`),
+    /// passed through to the coordinator's `lookup()` to scope the search.
     pub async fn route(
         &self,
+        scope: Option<&str>,
         namespace: &TrackNamespace,
     ) -> anyhow::Result<Option<RemoteConsumer>> {
         // Always fetch the origin instead of using the (potentially invalid) cache.
-        let (origin, client) = self.coordinator.lookup(namespace).await?;
+        let (origin, client) = self.coordinator.lookup(scope, namespace).await?;
 
         // Check if we already have a remote for this origin
         let state = self.state.lock();
@@ -235,23 +242,24 @@ impl RemoteProducer {
             &self.quic
         };
         // TODO reuse QUIC and MoQ sessions
-        let (session, _quic_client_initial_cid) = match client.connect(&self.url, self.addr).await {
-            Ok(session) => session,
-            Err(err) => {
-                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
-                    .increment(1);
-                return Err(err);
-            }
-        };
-        let (session, subscriber) = match moq_transport::session::Subscriber::connect(session).await
-        {
-            Ok(session) => session,
-            Err(err) => {
-                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
-                    .increment(1);
-                return Err(err.into());
-            }
-        };
+        let (session, _quic_client_initial_cid, transport) =
+            match client.connect(&self.url, self.addr).await {
+                Ok(session) => session,
+                Err(err) => {
+                    metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
+                        .increment(1);
+                    return Err(err);
+                }
+            };
+        let (session, subscriber) =
+            match moq_transport::session::Subscriber::connect(session, transport).await {
+                Ok(session) => session,
+                Err(err) => {
+                    metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
+                        .increment(1);
+                    return Err(err.into());
+                }
+            };
 
         // Track established upstream connections - decrements when this function returns.
         // Placed after successful connect + session setup so the gauge only reflects

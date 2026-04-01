@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // TODO: Unimplemented control message events (not yet needed for basic relay interop testing):
 // - SubscribeUpdate (parsed/created)
 // - PublishNamespaceDone (parsed/created)

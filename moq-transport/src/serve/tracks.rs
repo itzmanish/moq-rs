@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! A broadcast is a collection of tracks, split into two handles: [Writer] and [Reader].
 //!
 //! The [Writer] can create tracks, either manually or on request.
@@ -216,7 +220,6 @@ impl TracksReader {
                 return Some(track_reader.clone());
             }
             // Track is closed/stale, fall through to create a new one
-            // We'll remove the stale entry and request a fresh track from the publisher
             tracing::debug!(
                 target: "moq_transport::tracks",
                 namespace = %namespace.to_utf8_path(),
@@ -612,5 +615,80 @@ mod tests {
             assert_eq!(*gid, 0);
             assert_eq!(data, &payload(0, *oid));
         }
+    /// Test that a track is NOT considered stale after the writer transitions to
+    /// subgroups mode. This is the core regression: TrackWriter::subgroups()
+    /// consumes self, dropping the Track-level State, but the SubgroupsWriter
+    /// is still alive — so is_closed() must return false.
+    #[tokio::test]
+    async fn test_track_not_stale_after_subgroups_transition() {
+        let namespace = TrackNamespace::from_utf8_path("test/namespace");
+        let track_name = "test-track";
+
+        let (_writer, mut request, mut reader) = Tracks::new(namespace.clone()).produce();
+
+        let _track_reader_1 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("first subscribe should succeed");
+
+        let track_writer = request
+            .next()
+            .await
+            .expect("publisher should receive track request");
+
+        let _subgroups_writer = track_writer
+            .subgroups()
+            .expect("subgroups transition should succeed");
+
+        let _track_reader_2 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("second subscribe should succeed");
+
+        let maybe_second_request =
+            tokio::time::timeout(std::time::Duration::from_millis(100), request.next()).await;
+
+        assert!(
+            maybe_second_request.is_err(),
+            "publisher should NOT get a second request while SubgroupsWriter is alive"
+        );
+    }
+
+    /// Test that a track IS considered stale after the SubgroupsWriter is dropped.
+    /// This preserves the RT-458 eviction behavior for dead publishers.
+    #[tokio::test]
+    async fn test_track_stale_after_subgroups_writer_dropped() {
+        let namespace = TrackNamespace::from_utf8_path("test/namespace");
+        let track_name = "test-track";
+
+        let (_writer, mut request, mut reader) = Tracks::new(namespace.clone()).produce();
+
+        let _track_reader_1 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("first subscribe should succeed");
+
+        let track_writer = request
+            .next()
+            .await
+            .expect("publisher should receive track request");
+
+        let subgroups_writer = track_writer
+            .subgroups()
+            .expect("subgroups transition should succeed");
+        drop(subgroups_writer);
+
+        let _track_reader_2 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("second subscribe should succeed");
+
+        let maybe_second_request =
+            tokio::time::timeout(std::time::Duration::from_millis(100), request.next()).await;
+
+        assert!(
+            maybe_second_request.is_ok(),
+            "publisher should get a new request after SubgroupsWriter is dropped"
+        );
+
+        let _second_request = maybe_second_request
+            .unwrap()
+            .expect("publisher should receive second track request");
     }
 }
