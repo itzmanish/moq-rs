@@ -479,10 +479,7 @@ mod tests {
 
         // Publisher side: receive request, write data
         let pub_handle = tokio::spawn(async move {
-            let track_writer = request
-                .next()
-                .await
-                .expect("should receive track request");
+            let track_writer = request.next().await.expect("should receive track request");
 
             assert_eq!(track_writer.name, track_name);
 
@@ -587,13 +584,11 @@ mod tests {
             .expect("second subscribe");
 
         // Publisher receives the new request and writes real data
-        let track_writer_2 = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            request.next(),
-        )
-        .await
-        .expect("should receive second request")
-        .expect("second request should be Some");
+        let track_writer_2 =
+            tokio::time::timeout(std::time::Duration::from_millis(100), request.next())
+                .await
+                .expect("should receive second request")
+                .expect("second request should be Some");
 
         let write_handle = tokio::spawn(async move {
             let mut subgroups = track_writer_2.subgroups().unwrap();
