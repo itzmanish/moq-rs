@@ -21,9 +21,10 @@ impl TrackStatusRequested {
         error_code: u64,
         error_message: &str,
     ) -> Result<(), SessionError> {
-        let status_error = message::TrackStatusError {
+        let status_error = message::RequestError {
             id: self.request_msg.id,
             error_code,
+            retry_interval: 0,
             reason_phrase: ReasonPhrase(error_message.to_string()),
         };
         self.publisher.send_message(status_error);

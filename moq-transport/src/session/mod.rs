@@ -1,19 +1,27 @@
-mod announce;
-mod announced;
 mod error;
+mod publish_namespace;
+mod publish_namespace_received;
+mod publish_received;
+mod published;
 mod publisher;
 mod reader;
 mod subscribe;
+mod subscribe_namespace;
+mod subscribe_namespace_received;
 mod subscribed;
 mod subscriber;
 mod track_status_requested;
 mod writer;
 
-pub use announce::*;
-pub use announced::*;
 pub use error::*;
+pub use publish_namespace::*;
+pub use publish_namespace_received::*;
+pub use publish_received::*;
+pub use published::*;
 pub use publisher::*;
 pub use subscribe::*;
+pub use subscribe_namespace::*;
+pub use subscribe_namespace_received::*;
 pub use subscribed::*;
 pub use subscriber::*;
 pub use track_status_requested::*;
@@ -52,14 +60,6 @@ pub struct Session {
 }
 
 impl Session {
-    // Helper for determining the largest supported version
-    fn largest_common<T: Ord + Clone + Eq>(a: &[T], b: &[T]) -> Option<T> {
-        a.iter()
-            .filter(|x| b.contains(x)) // keep only items also in b
-            .cloned() // clone because we return T, not &T
-            .max() // take the largest
-    }
-
     fn new(
         webtransport: web_transport::Session,
         sender: Writer,
@@ -101,7 +101,7 @@ impl Session {
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for
     /// MOQT control messaging.  Performs SETUP messaging and version negotiation.
     pub async fn connect(
-        mut session: web_transport::Session,
+        session: web_transport::Session,
         mlog_path: Option<PathBuf>,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         let mlog = mlog_path.and_then(|path| {
@@ -113,16 +113,10 @@ impl Session {
         let mut sender = Writer::new(control.0);
         let mut recver = Reader::new(control.1);
 
-        let versions: setup::Versions = [setup::Version::DRAFT_14].into();
-
-        // TODO SLG - make configurable?
         let mut params = KeyValuePairs::default();
         params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
 
-        let client = setup::Client {
-            versions: versions.clone(),
-            params,
-        };
+        let client = setup::Client { params };
 
         log::debug!("sending CLIENT_SETUP: {:?}", client);
         sender.encode(&client).await?;
@@ -142,7 +136,7 @@ impl Session {
     /// Accepts an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for
     /// MOQT control messaging.  Performs SETUP messaging and version negotiation.
     pub async fn accept(
-        mut session: web_transport::Session,
+        session: web_transport::Session,
         mlog_path: Option<PathBuf>,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let mut mlog = mlog_path.and_then(|path| {
@@ -163,35 +157,24 @@ impl Session {
             let _ = mlog.add_event(event);
         }
 
-        let server_versions = setup::Versions(vec![setup::Version::DRAFT_14]);
+        // TODO SLG - make configurable?
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
 
-        if let Some(largest_common_version) =
-            Self::largest_common(&server_versions, &client.versions)
-        {
-            // TODO SLG - make configurable?
-            let mut params = KeyValuePairs::default();
-            params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
+        let server = setup::Server { params };
 
-            let server = setup::Server {
-                version: largest_common_version,
-                params,
-            };
+        log::debug!("sending SERVER_SETUP: {:?}", server);
 
-            log::debug!("sending SERVER_SETUP: {:?}", server);
-
-            // Emit mlog event for SERVER_SETUP created
-            if let Some(ref mut mlog) = mlog {
-                let event = mlog::events::server_setup_created(mlog.elapsed_ms(), 0, &server);
-                let _ = mlog.add_event(event);
-            }
-
-            sender.encode(&server).await?;
-
-            // We are the server, so the first request id is 1
-            Ok(Session::new(session, sender, recver, 1, mlog))
-        } else {
-            Err(SessionError::Version(client.versions, server_versions))
+        // Emit mlog event for SERVER_SETUP created
+        if let Some(ref mut mlog) = mlog {
+            let event = mlog::events::server_setup_created(mlog.elapsed_ms(), 0, &server);
+            let _ = mlog.add_event(event);
         }
+
+        sender.encode(&server).await?;
+
+        // We are the server, so the first request id is 1
+        Ok(Session::new(session, sender, recver, 1, mlog))
     }
 
     /// Run Tasks for the session, including sending of control messages, receiving and processing
@@ -199,9 +182,10 @@ impl Session {
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
         tokio::select! {
-            res = Self::run_recv(self.recver, self.publisher, self.subscriber.clone(), self.mlog.clone()) => res,
+            res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone()) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
+            res = Self::run_bidi_streams(self.webtransport.clone(), self.publisher) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber) => res,
         }
     }
@@ -229,8 +213,8 @@ impl Session {
                         Message::SubscribeOk(m) => {
                             Some(mlog::events::subscribe_ok_created(time, stream_id, m))
                         }
-                        Message::SubscribeError(m) => {
-                            Some(mlog::events::subscribe_error_created(time, stream_id, m))
+                        Message::RequestError(m) => {
+                            Some(mlog::events::reqeust_error_created(time, stream_id, m))
                         }
                         Message::Unsubscribe(m) => {
                             Some(mlog::events::unsubscribe_created(time, stream_id, m))
@@ -238,16 +222,22 @@ impl Session {
                         Message::PublishNamespace(m) => {
                             Some(mlog::events::publish_namespace_created(time, stream_id, m))
                         }
-                        Message::PublishNamespaceOk(m) => Some(
-                            mlog::events::publish_namespace_ok_created(time, stream_id, m),
-                        ),
-                        Message::PublishNamespaceError(m) => Some(
-                            mlog::events::publish_namespace_error_created(time, stream_id, m),
-                        ),
+                        Message::RequestOk(m) => {
+                            Some(mlog::events::reqeust_ok_created(time, stream_id, m))
+                        }
                         Message::GoAway(m) => {
                             Some(mlog::events::go_away_created(time, stream_id, m))
                         }
-                        _ => None, // TODO: Add other message types
+                        Message::Publish(m) => {
+                            Some(mlog::events::publish_created(time, stream_id, m))
+                        }
+                        Message::PublishOk(m) => {
+                            Some(mlog::events::publish_ok_created(time, stream_id, m))
+                        }
+                        Message::PublishDone(m) => {
+                            Some(mlog::events::publish_done_created(time, stream_id, m))
+                        }
+                        _ => None,
                     };
 
                     if let Some(event) = event {
@@ -291,8 +281,8 @@ impl Session {
                         Message::SubscribeOk(m) => {
                             Some(mlog::events::subscribe_ok_parsed(time, stream_id, m))
                         }
-                        Message::SubscribeError(m) => {
-                            Some(mlog::events::subscribe_error_parsed(time, stream_id, m))
+                        Message::RequestError(m) => {
+                            Some(mlog::events::request_error_parsed(time, stream_id, m))
                         }
                         Message::Unsubscribe(m) => {
                             Some(mlog::events::unsubscribe_parsed(time, stream_id, m))
@@ -300,22 +290,51 @@ impl Session {
                         Message::PublishNamespace(m) => {
                             Some(mlog::events::publish_namespace_parsed(time, stream_id, m))
                         }
-                        Message::PublishNamespaceOk(m) => Some(
-                            mlog::events::publish_namespace_ok_parsed(time, stream_id, m),
-                        ),
-                        Message::PublishNamespaceError(m) => Some(
-                            mlog::events::publish_namespace_error_parsed(time, stream_id, m),
-                        ),
+                        Message::RequestOk(m) => {
+                            Some(mlog::events::request_ok_parsed(time, stream_id, m))
+                        }
                         Message::GoAway(m) => {
                             Some(mlog::events::go_away_parsed(time, stream_id, m))
                         }
-                        _ => None, // TODO: Add other message types
+                        Message::Publish(m) => {
+                            Some(mlog::events::publish_parsed(time, stream_id, m))
+                        }
+                        Message::PublishOk(m) => {
+                            Some(mlog::events::publish_ok_parsed(time, stream_id, m))
+                        }
+                        Message::PublishDone(m) => {
+                            Some(mlog::events::publish_done_parsed(time, stream_id, m))
+                        }
+                        _ => None,
                     };
 
                     if let Some(event) = event {
                         let _ = mlog_guard.add_event(event);
                     }
                 }
+            }
+
+            // RequestOk and RequestError are bidirectional — they can be responses
+            // to requests originated by either side (e.g., PUBLISH_NAMESPACE from the
+            // publisher or SUBSCRIBE_NAMESPACE from the subscriber). We must try both
+            // handlers so the response reaches whichever side owns that request ID.
+            match &msg {
+                Message::RequestOk(_) | Message::RequestError(_) => {
+                    // Try subscriber handler first (for SUBSCRIBE_NAMESPACE responses)
+                    if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg.clone()) {
+                        if let Some(sub) = subscriber.as_mut() {
+                            let _ = sub.recv_message(pub_msg);
+                        }
+                    }
+                    // Also try publisher handler (for PUBLISH_NAMESPACE responses)
+                    if let Ok(sub_msg) = TryInto::<message::Subscriber>::try_into(msg) {
+                        if let Some(pub_) = publisher.as_mut() {
+                            let _ = pub_.recv_message(sub_msg);
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
             }
 
             let msg = match TryInto::<message::Publisher>::try_into(msg) {
@@ -353,7 +372,7 @@ impl Session {
     /// Will read stream header to know what type of stream it is and create
     /// the appropriate stream handlers.
     async fn run_streams(
-        mut webtransport: web_transport::Session,
+        webtransport: web_transport::Session,
         subscriber: Option<Subscriber>,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
@@ -375,9 +394,55 @@ impl Session {
         }
     }
 
+    /// Accepts bidirectional QUIC streams for messages like SUBSCRIBE_NAMESPACE.
+    /// In draft-16, SUBSCRIBE_NAMESPACE uses its own bidirectional stream.
+    async fn run_bidi_streams(
+        webtransport: web_transport::Session,
+        publisher: Option<Publisher>,
+    ) -> Result<(), SessionError> {
+        let mut tasks = FuturesUnordered::new();
+
+        loop {
+            tokio::select! {
+                res = webtransport.accept_bi() => {
+                    let (_send, recv) = res?;
+                    let mut publisher = publisher.clone().ok_or(SessionError::RoleViolation)?;
+
+                    tasks.push(async move {
+                        let mut reader = Reader::new(recv);
+
+                        // Read the message from the bidi stream
+                        let msg: message::Message = match reader.decode().await {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                log::warn!("failed to decode message on bidi stream: {}", e);
+                                return;
+                            }
+                        };
+
+                        log::debug!("received message on bidi stream: {:?}", msg);
+
+                        // Handle SUBSCRIBE_NAMESPACE on its dedicated bidi stream
+                        match msg {
+                            Message::SubscribeNamespace(subscribe_ns) => {
+                                if let Err(e) = publisher.recv_message(message::Subscriber::SubscribeNamespace(subscribe_ns)) {
+                                    log::warn!("failed to handle SUBSCRIBE_NAMESPACE: {}", e);
+                                }
+                            }
+                            other => {
+                                log::warn!("unexpected message type on bidi stream: {:?}", other);
+                            }
+                        }
+                    });
+                },
+                _ = tasks.next(), if !tasks.is_empty() => {},
+            };
+        }
+    }
+
     /// Receives QUIC datagrams and processes them using the Subscriber logic
     async fn run_datagrams(
-        mut webtransport: web_transport::Session,
+        webtransport: web_transport::Session,
         mut subscriber: Option<Subscriber>,
     ) -> Result<(), SessionError> {
         loop {
