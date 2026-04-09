@@ -48,14 +48,12 @@ macro_rules! publisher_msgs {
 publisher_msgs! {
     PublishNamespace,
     PublishNamespaceDone,
+    Namespace,
     Publish,
     PublishDone,
     SubscribeOk,
-    SubscribeError,
     TrackStatusOk,
-    TrackStatusError,
     FetchOk,
-    FetchError,
-    SubscribeNamespaceOk,
-    SubscribeNamespaceError,
+    RequestOk,
+    RequestError,
 }
