@@ -114,6 +114,11 @@ impl DatagramsReader {
             .as_ref()
             .map(|datagram| (datagram.group_id, datagram.object_id))
     }
+
+    pub fn is_closed(&self) -> bool {
+        let state = self.state.lock();
+        state.closed.is_err() || state.modified().is_none()
+    }
 }
 
 /// Static information about the datagram.
@@ -126,6 +131,9 @@ pub struct Datagram {
 
     // Extension headers (for draft-14 compliance, particularly immutable extensions)
     pub extension_headers: crate::data::ExtensionHeaders,
+
+    // Object status (e.g., EndOfGroup)
+    pub status: Option<crate::data::ObjectStatus>,
 }
 
 impl fmt::Debug for Datagram {
@@ -136,6 +144,7 @@ impl fmt::Debug for Datagram {
             .field("priority", &self.priority)
             .field("payload", &self.payload.len())
             .field("extension_headers", &self.extension_headers)
+            .field("status", &self.status)
             .finish()
     }
 }
