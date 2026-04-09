@@ -384,7 +384,12 @@ impl Track {
     }
 
     pub fn end_group(&mut self) {
-        self.current = None;
+        // Send EndOfGroup marker before dropping the writer
+        if let Some(mut current) = self.current.take() {
+            if let Err(e) = current.end_of_group() {
+                log::warn!("failed to send EndOfGroup marker: {}", e);
+            }
+        }
     }
 }
 

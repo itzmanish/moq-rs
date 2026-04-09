@@ -45,6 +45,7 @@ impl Publisher {
                         group_id: next_group_id as u64,
                         subgroup_id: 0,
                         priority: 0,
+                        header_type: None,
                     })
                     .context("failed to create minute segment")?;
 
@@ -66,6 +67,7 @@ impl Publisher {
                         priority: 127,
                         payload: time_str.clone().into_bytes().into(),
                         extension_headers: Default::default(),
+                        status: None,
                     })
                     .context("failed to write datagram")?;
 
