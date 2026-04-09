@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.15](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.14...moq-relay-ietf-v0.7.15) - 2026-04-09
+
+### Fixed
+
+- include destination address in upstream connection cache key
+
 ## [0.7.14](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.13...moq-relay-ietf-v0.7.14) - 2026-03-31
 
 ### Other
