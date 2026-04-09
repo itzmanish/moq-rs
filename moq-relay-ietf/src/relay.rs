@@ -8,6 +8,7 @@ use url::Url;
 
 use crate::{
     Consumer, Coordinator, Locals, Producer, Remotes, RemotesConsumer, RemotesProducer, Session,
+    SubscriberRegistry,
 };
 
 // A type alias for boxed future
@@ -58,6 +59,7 @@ pub struct Relay {
     locals: Locals,
     remotes: Option<(RemotesProducer, RemotesConsumer)>,
     coordinator: Arc<dyn Coordinator>,
+    subscriber_registry: SubscriberRegistry,
 }
 
 impl Relay {
@@ -107,6 +109,9 @@ impl Relay {
         }
         .produce();
 
+        // Create subscriber registry for SUBSCRIBE_NAMESPACE tracking
+        let subscriber_registry = SubscriberRegistry::new();
+
         Ok(Self {
             quic_endpoints: endpoints,
             announce_url: config.announce,
@@ -114,6 +119,7 @@ impl Relay {
             locals,
             remotes: Some(remotes),
             coordinator: config.coordinator,
+            subscriber_registry,
         })
     }
 
@@ -219,6 +225,7 @@ impl Relay {
                     let remotes = remotes.clone();
                     let forward = forward_producer.clone();
                     let coordinator = self.coordinator.clone();
+                    let subscriber_registry = self.subscriber_registry.clone();
 
                     // Spawn a new task to handle the connection
                     tasks.push(async move {
@@ -235,8 +242,23 @@ impl Relay {
                         let moq_session = session;
                         let session = Session {
                             session: moq_session,
-                            producer: publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes)),
-                            consumer: subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward)),
+                            producer: publisher.map(|publisher| {
+                                Producer::with_registry(
+                                    publisher,
+                                    locals.clone(),
+                                    remotes,
+                                    subscriber_registry.clone(),
+                                )
+                            }),
+                            consumer: subscriber.map(|subscriber| {
+                                Consumer::with_registry(
+                                    subscriber,
+                                    locals,
+                                    coordinator,
+                                    forward,
+                                    subscriber_registry,
+                                )
+                            }),
                         };
 
                         if let Err(err) = session.run().await {

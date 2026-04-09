@@ -36,6 +36,7 @@ mod producer;
 mod relay;
 mod remote;
 mod session;
+mod subscriber_registry;
 mod web;
 
 pub use api::*;
@@ -46,4 +47,5 @@ pub use producer::*;
 pub use relay::*;
 pub use remote::*;
 pub use session::*;
+pub use subscriber_registry::*;
 pub use web::*;
