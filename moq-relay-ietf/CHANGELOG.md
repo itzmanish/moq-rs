@@ -6,6 +6,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.17](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.16...moq-relay-ietf-v0.7.17) - 2026-04-13
+
+### Fixed
+
+- always register in coordinator after registering in local
+
+### Other
+
+- Merge branch 'main' of github.com:itzmanish/moq-rs into fix-register-order-namespace
+
+## [0.7.16](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.15...moq-relay-ietf-v0.7.16) - 2026-04-10
+
+### Fixed
+
+- cross-platform dual-stack binding for IPv6 sockets
+
+### Other
+
+- Merge pull request #151 from englishm-cloudflare/me/ipv6-dual-stack-binding
+
+## [0.7.15](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.14...moq-relay-ietf-v0.7.15) - 2026-04-09
+
+### Fixed
+
+- include destination address in upstream connection cache key
+
+## [0.7.14](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.13...moq-relay-ietf-v0.7.14) - 2026-03-31
+
+### Other
+
+- Make repo REUSE v3.3 compliant
+- Bring copyright notices, license docs up to date
+
+## [0.7.13](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.12...moq-relay-ietf-v0.7.13) - 2026-03-27
+
+### Added
+
+- actively reject unauthorized control messages on permission-gated sessions
+- add scope-aware namespace isolation to ApiCoordinator
+- add Coordinator stubs for SUBSCRIBE_NAMESPACE, track PUBLISH, and lingering subscriber support
+- add resolve_scope() to Coordinator trait with permission-gated sessions
+- add scope parameter to Coordinator trait and thread through relay
+- add Transport enum and connection path extraction
+
 ## [0.7.12](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.11...moq-relay-ietf-v0.7.12) - 2026-02-18
 
 ### Other

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::{coding, serve, setup};
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -36,6 +40,9 @@ pub enum SessionError {
 
     #[error("wrong size")]
     WrongSize,
+
+    #[error("invalid connection path: {0}")]
+    InvalidPath(String),
 }
 
 // Session Termination Error Codes from draft-ietf-moq-transport-14 Section 13.1.1
@@ -56,6 +63,7 @@ impl SessionError {
             // PROTOCOL_VIOLATION (0x3) - Malformed messages
             Self::Decode(_) => 0x3,
             Self::WrongSize => 0x3,
+            Self::InvalidPath(_) => 0x3,
             // DUPLICATE_TRACK_ALIAS (0x5)
             Self::Duplicate => 0x5,
             // Delegate to ServeError for per-request error codes

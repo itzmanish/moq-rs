@@ -1,11 +1,14 @@
+# SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "moq-relay-ietf"
 description = "Media over QUIC"
-authors = ["Luke Curley", "Manish Kumar Pandit"]
+authors = ["moq-rs contributors"]
 repository = "https://github.com/cloudflare/moq-rs"
 license = "MIT OR Apache-2.0"
 
-version = "0.7.12"
+version = "0.7.17"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]
@@ -20,8 +23,8 @@ name = "moq-relay-ietf"
 path = "src/bin/moq-relay-ietf/main.rs"
 
 [dependencies]
-moq-transport = { path = "../moq-transport", version = "0.13" }
-moq-native-ietf = { path = "../moq-native-ietf", version = "0.7" }
+moq-transport = { path = "../moq-transport", version = "0.14" }
+moq-native-ietf = { path = "../moq-native-ietf", version = "0.8" }
 moq-api = { path = "../moq-api", version = "0.2" }
 web-transport = { workspace = true }
 

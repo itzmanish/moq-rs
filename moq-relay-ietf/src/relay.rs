@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::{future::Future, net, path::PathBuf, pin::Pin, sync::Arc};
 
 use anyhow::Context;
@@ -16,7 +19,11 @@ type ServerFuture = Pin<
     Box<
         dyn Future<
             Output = (
-                anyhow::Result<(web_transport::Session, String)>,
+                anyhow::Result<(
+                    web_transport::Session,
+                    String,
+                    moq_transport::session::Transport,
+                )>,
                 quic::Server,
             ),
         >,
@@ -72,7 +79,7 @@ impl Relay {
                 bind,
                 config.qlog_dir.clone(),
                 config.tls.clone(),
-            ))?;
+            )?)?;
             vec![endpoint]
         } else {
             config.endpoints
@@ -133,7 +140,7 @@ impl Relay {
             tracing::info!("forwarding announces to {}", url);
 
             // Establish a QUIC connection to the forward URL
-            let (session, _quic_client_initial_cid) = self.quic_endpoints[0]
+            let (session, _quic_client_initial_cid, transport) = self.quic_endpoints[0]
                 .client
                 .connect(url, None)
                 .await
@@ -141,11 +148,25 @@ impl Relay {
 
             // Create the MoQ session over the connection
             let (session, publisher, subscriber) =
-                moq_transport::session::Session::connect(session, None)
+                moq_transport::session::Session::connect(session, None, transport)
                     .await
                     .context("failed to establish forward session")?;
 
-            // Create a normal looking session, except we never forward or register announces.
+            // Use the connection path already validated and stored by Session::connect().
+            // The forward session is scoped to whatever path the announce URL specifies.
+            //
+            // Note: the forward connection intentionally does not call
+            // coordinator.resolve_scope(). The announce URL is operator-configured
+            // (via --announce), not client-supplied, so it doesn't need the same
+            // auth/permission checks that incoming client connections get. The
+            // forward session always gets both Producer and Consumer (full
+            // read-write) since it's acting as a relay peer, not a client.
+            //
+            // Limitation: all incoming scopes are forwarded to this single upstream scope.
+            // Multi-scope forwarding (routing different incoming scopes to different
+            // upstream paths) would require per-scope forward connections.
+            let forward_scope = session.connection_path().map(|s| s.to_string());
+
             let coordinator = self.coordinator.clone();
             let session = Session {
                 session,
@@ -153,13 +174,19 @@ impl Relay {
                     publisher,
                     self.locals.clone(),
                     remotes.clone(),
+                    forward_scope.clone(),
                 )),
                 consumer: Some(Consumer::new(
                     subscriber,
                     self.locals.clone(),
                     coordinator,
                     None,
+                    forward_scope,
                 )),
+                // Forward connections are always full read-write relay peers,
+                // so no reject loops needed.
+                reject_publishes: None,
+                reject_subscribes: None,
             };
 
             let forward_producer = session.producer.clone();
@@ -210,7 +237,7 @@ impl Relay {
                         .boxed(),
                     );
 
-                    let (conn, connection_id) = conn_result.context("failed to accept QUIC connection")?;
+                    let (conn, connection_id, transport) = conn_result.context("failed to accept QUIC connection")?;
 
                     metrics::counter!("moq_relay_connections_total").increment(1);
 
@@ -228,8 +255,12 @@ impl Relay {
                         // Track active connections - decrements when task completes
                         let _conn_guard = GaugeGuard::new("moq_relay_active_connections");
 
+                        // Clone the raw connection so we can close it with a proper
+                        // error code if scope resolution fails after the MoQ handshake.
+                        let raw_conn = conn.clone();
+
                         // Create the MoQ session over the connection (setup handshake etc)
-                        let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path).await {
+                        let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path, transport).await {
                             Ok(session) => session,
                             Err(err) => {
                                 tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);
@@ -242,10 +273,71 @@ impl Relay {
 
                         // Create our MoQ relay session
                         let moq_session = session;
+
+                        // Resolve the connection path to a scope (identity + permissions).
+                        // This translates the raw transport-level path into an application-level
+                        // scope_id and determines what the connection is allowed to do.
+                        let scope_info = match coordinator.resolve_scope(moq_session.connection_path()).await {
+                            Ok(info) => info,
+                            Err(err) => {
+                                tracing::warn!(
+                                    connection_path = moq_session.connection_path(),
+                                    error = %err,
+                                    "scope resolution failed, rejecting session"
+                                );
+                                // Close with PROTOCOL_VIOLATION (0x3) so the client
+                                // gets a meaningful error instead of an abrupt reset.
+                                // This is a QUIC APPLICATION_CLOSE, not a MoQT SESSION_CLOSE
+                                // control message. Sending a proper SESSION_CLOSE would require
+                                // running the MoQ session's send loop, which is not warranted
+                                // for a pre-session rejection. The QUIC close code and reason
+                                // string are visible to the client's transport layer.
+                                raw_conn.close(0x3, "scope resolution failed");
+                                metrics::counter!("moq_relay_connection_errors_total", "stage" => "scope_resolve").increment(1);
+                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                return Ok(());
+                            }
+                        };
+
+                        let scope_id = scope_info.as_ref().map(|s| s.scope_id.clone());
+                        let can_publish = scope_info.as_ref().is_none_or(|s| s.permissions.can_publish());
+                        let can_subscribe = scope_info.as_ref().is_none_or(|s| s.permissions.can_subscribe());
+
+                        if let Some(ref info) = scope_info {
+                            tracing::debug!(
+                                connection_path = moq_session.connection_path(),
+                                scope_id = %info.scope_id,
+                                permissions = ?info.permissions,
+                                "scope resolved"
+                            );
+                        }
+
+                        // Gate Producer/Consumer creation on permissions.
+                        // Note the intentional inversion:
+                        // - Producer serves SUBSCRIBEs → gated on can_subscribe
+                        // - Consumer handles PUBLISH_NAMESPACEs → gated on can_publish
+                        //
+                        // When a half is disabled, we pass its transport counterpart
+                        // to the Session's reject fields so unauthorized messages get
+                        // an explicit error response instead of being silently ignored.
+                        let (producer, reject_subscribes) = if can_subscribe {
+                            (publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, scope_id.clone())), None)
+                        } else {
+                            (None, publisher)
+                        };
+
+                        let (consumer, reject_publishes) = if can_publish {
+                            (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope_id)), None)
+                        } else {
+                            (None, subscriber)
+                        };
+
                         let session = Session {
                             session: moq_session,
-                            producer: publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes)),
-                            consumer: subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward)),
+                            producer,
+                            consumer,
+                            reject_publishes,
+                            reject_subscribes,
                         };
 
                         match session.run().await {

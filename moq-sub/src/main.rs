@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::net;
 
 use anyhow::Context;
@@ -23,16 +27,16 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::parse();
     let tls = config.tls.load()?;
-    let quic = quic::Endpoint::new(quic::Config::new(config.bind, None, tls))?;
+    let quic = quic::Endpoint::new(quic::Config::new(config.bind, None, tls)?)?;
 
-    let (session, connection_id) = quic.client.connect(&config.url, None).await?;
+    let (session, connection_id, transport) = quic.client.connect(&config.url, None).await?;
 
     tracing::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
         connection_id
     );
 
-    let (session, subscriber) = moq_transport::session::Subscriber::connect(session)
+    let (session, subscriber) = moq_transport::session::Subscriber::connect(session, transport)
         .await
         .context("failed to create MoQ Transport session")?;
 

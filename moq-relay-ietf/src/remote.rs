@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::collections::HashMap;
 
 use std::collections::VecDeque;
@@ -6,6 +9,17 @@ use std::net::SocketAddr;
 use std::ops;
 use std::sync::Arc;
 use std::sync::Weak;
+
+/// Cache key for upstream relay-to-relay connections.
+///
+/// Keyed by both URL and destination address so that connections are
+/// reused only when both match. This matters when a [`Coordinator`]
+/// returns the same URL for different namespaces (e.g. a shared relay
+/// hostname) but distinguishes destinations via [`NamespaceOrigin::addr`].
+/// Without the address in the key, all namespaces that share a URL
+/// would be routed through a single cached connection to whichever
+/// upstream host was contacted first.
+type RemoteCacheKey = (Url, Option<SocketAddr>);
 
 use futures::stream::FuturesUnordered;
 use futures::FutureExt;
@@ -41,7 +55,7 @@ impl Remotes {
 
 #[derive(Default)]
 struct RemotesState {
-    lookup: HashMap<Url, RemoteConsumer>,
+    lookup: HashMap<RemoteCacheKey, RemoteConsumer>,
     requested: VecDeque<RemoteProducer>,
 }
 
@@ -80,6 +94,7 @@ impl RemotesProducer {
             tokio::select! {
                 Some(mut remote) = self.next() => {
                     let url = remote.url.clone();
+                    let cache_key = (url.clone(), remote.addr);
 
                     // Spawn a task to serve the remote
                     tasks.push(async move {
@@ -93,16 +108,16 @@ impl RemotesProducer {
                             tracing::warn!(remote_url = %remote_url, error = %err, "failed serving remote: {:?}, error: {}", info, err);
                         }
 
-                        url
+                        cache_key
                     });
                 }
 
                 // Handle finished remote producers
                 res = tasks.next(), if !tasks.is_empty() => {
-                    let url = res.unwrap();
+                    let cache_key = res.unwrap();
 
                     if let Some(mut state) = self.state.lock_mut() {
-                        state.lookup.remove(&url);
+                        state.lookup.remove(&cache_key);
                     }
                 },
                 else => return Ok(()),
@@ -131,16 +146,22 @@ impl RemotesConsumer {
     }
 
     /// Route to a remote origin based on the namespace.
+    ///
+    /// `scope` is the resolved scope identity (from `Coordinator::resolve_scope()`),
+    /// passed through to the coordinator's `lookup()` to scope the search.
     pub async fn route(
         &self,
+        scope: Option<&str>,
         namespace: &TrackNamespace,
     ) -> anyhow::Result<Option<RemoteConsumer>> {
         // Always fetch the origin instead of using the (potentially invalid) cache.
-        let (origin, client) = self.coordinator.lookup(namespace).await?;
+        let (origin, client) = self.coordinator.lookup(scope, namespace).await?;
+
+        let cache_key = (origin.url(), origin.addr());
 
         // Check if we already have a remote for this origin
         let state = self.state.lock();
-        if let Some(remote) = state.lookup.get(&origin.url()).cloned() {
+        if let Some(remote) = state.lookup.get(&cache_key).cloned() {
             return Ok(Some(remote));
         }
 
@@ -161,8 +182,8 @@ impl RemotesConsumer {
         let (writer, reader) = remote.produce();
         state.requested.push_back(writer);
 
-        // Insert the remote into our Map
-        state.lookup.insert(origin.url(), reader.clone());
+        // Insert the remote into our Map, keyed by both URL and destination address
+        state.lookup.insert(cache_key, reader.clone());
 
         Ok(Some(reader))
     }
@@ -235,23 +256,24 @@ impl RemoteProducer {
             &self.quic
         };
         // TODO reuse QUIC and MoQ sessions
-        let (session, _quic_client_initial_cid) = match client.connect(&self.url, self.addr).await {
-            Ok(session) => session,
-            Err(err) => {
-                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
-                    .increment(1);
-                return Err(err);
-            }
-        };
-        let (session, subscriber) = match moq_transport::session::Subscriber::connect(session).await
-        {
-            Ok(session) => session,
-            Err(err) => {
-                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
-                    .increment(1);
-                return Err(err.into());
-            }
-        };
+        let (session, _quic_client_initial_cid, transport) =
+            match client.connect(&self.url, self.addr).await {
+                Ok(session) => session,
+                Err(err) => {
+                    metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
+                        .increment(1);
+                    return Err(err);
+                }
+            };
+        let (session, subscriber) =
+            match moq_transport::session::Subscriber::connect(session, transport).await {
+                Ok(session) => session,
+                Err(err) => {
+                    metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
+                        .increment(1);
+                    return Err(err.into());
+                }
+            };
 
         // Track established upstream connections - decrements when this function returns.
         // Placed after successful connect + session setup so the gauge only reflects

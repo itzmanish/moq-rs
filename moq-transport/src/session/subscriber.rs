@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::{
     collections::{hash_map, HashMap},
     io,
@@ -74,14 +78,20 @@ impl Subscriber {
     }
 
     /// Create an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for control messages.
-    pub async fn accept(session: web_transport::Session) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) = Session::accept(session, None).await?;
+    pub async fn accept(
+        session: web_transport::Session,
+        transport: super::Transport,
+    ) -> Result<(Session, Self), SessionError> {
+        let (session, _, subscriber) = Session::accept(session, None, transport).await?;
         Ok((session, subscriber.unwrap()))
     }
 
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for control messages.
-    pub async fn connect(session: web_transport::Session) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) = Session::connect(session, None).await?;
+    pub async fn connect(
+        session: web_transport::Session,
+        transport: super::Transport,
+    ) -> Result<(Session, Self), SessionError> {
+        let (session, _, subscriber) = Session::connect(session, None, transport).await?;
         Ok((session, subscriber))
     }
 

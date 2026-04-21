@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
     serve::{ServeError, TracksReader},
@@ -15,14 +18,24 @@ pub struct Producer {
     publisher: Publisher,
     locals: Locals,
     remotes: Option<RemotesConsumer>,
+    /// The resolved scope identity for this session, if any.
+    /// Produced by `Coordinator::resolve_scope()` from the connection path.
+    /// Passed to locals/remotes to isolate namespace lookups.
+    scope: Option<String>,
 }
 
 impl Producer {
-    pub fn new(publisher: Publisher, locals: Locals, remotes: Option<RemotesConsumer>) -> Self {
+    pub fn new(
+        publisher: Publisher,
+        locals: Locals,
+        remotes: Option<RemotesConsumer>,
+        scope: Option<String>,
+    ) -> Self {
         Self {
             publisher,
             locals,
             remotes,
+            scope,
         }
     }
 
@@ -96,7 +109,7 @@ impl Producer {
         let track_name = subscribed.track_name.clone();
 
         // Check local tracks first, and serve from local if possible
-        if let Some(mut local) = self.locals.retrieve(&namespace) {
+        if let Some(mut local) = self.locals.retrieve(self.scope.as_deref(), &namespace) {
             // Pass the full requested namespace, not the announced prefix
             if let Some(track) = local.subscribe(namespace.clone(), &track_name) {
                 let ns = namespace.to_utf8_path();
@@ -111,7 +124,7 @@ impl Producer {
 
         if let Some(remotes) = self.remotes {
             // Check remote tracks second, and serve from remote if possible
-            match remotes.route(&namespace).await {
+            match remotes.route(self.scope.as_deref(), &namespace).await {
                 Ok(remote) => {
                     if let Some(remote) = remote {
                         if let Some(track) = remote.subscribe(&namespace, &track_name)? {
@@ -163,10 +176,10 @@ impl Producer {
         mut track_status_requested: TrackStatusRequested,
     ) -> Result<(), anyhow::Error> {
         // Check local tracks first, and serve from local if possible
-        if let Some(mut local_tracks) = self
-            .locals
-            .retrieve(&track_status_requested.request_msg.track_namespace)
-        {
+        if let Some(mut local_tracks) = self.locals.retrieve(
+            self.scope.as_deref(),
+            &track_status_requested.request_msg.track_namespace,
+        ) {
             if let Some(track) = local_tracks.get_track_reader(
                 &track_status_requested.request_msg.track_namespace,
                 &track_status_requested.request_msg.track_name,

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use bytes::BytesMut;
 use std::net;
 use url::Url;
@@ -62,17 +66,17 @@ async fn main() -> anyhow::Result<()> {
         cli.bind,
         None,
         tls.clone(),
-    ))?;
+    )?)?;
 
     tracing::info!("connecting to relay: url={}", cli.url);
-    let (session, connection_id) = quic.client.connect(&cli.url, None).await?;
+    let (session, connection_id, transport) = quic.client.connect(&cli.url, None).await?;
 
     tracing::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
         connection_id
     );
 
-    let (session, mut publisher) = Publisher::connect(session)
+    let (session, mut publisher) = Publisher::connect(session, transport)
         .await
         .context("failed to create MoQ Transport publisher")?;
 
