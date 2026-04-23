@@ -7,9 +7,11 @@ use std::{
     future::Future,
     ops::{Deref, DerefMut},
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    sync::{Arc, Weak},
     task,
 };
+
+use parking_lot::{Mutex, MutexGuard};
 
 struct StateInner<T> {
     value: T,
@@ -72,12 +74,12 @@ impl<T> State<T> {
         StateRef {
             state: self.state.clone(),
             drop: self.drop.clone(),
-            lock: self.state.lock().unwrap(),
+            lock: self.state.lock(),
         }
     }
 
     pub fn lock_mut(&self) -> Option<StateMut<'_, T>> {
-        let lock = self.state.lock().unwrap();
+        let lock = self.state.lock();
         lock.dropped?;
         Some(StateMut {
             lock,
@@ -122,8 +124,8 @@ impl<T: Default> Default for State<T> {
 impl<T: fmt::Debug> fmt::Debug for State<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.state.try_lock() {
-            Ok(lock) => lock.value.fmt(f),
-            Err(_) => write!(f, "<locked>"),
+            Some(lock) => lock.value.fmt(f),
+            None => write!(f, "<locked>"),
         }
     }
 }
@@ -210,7 +212,7 @@ impl<T> Future for StateChanged<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
         // TODO is there an API we can make that doesn't drop this lock?
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
 
         if state.epoch > self.epoch {
             task::Poll::Ready(())
@@ -251,7 +253,7 @@ struct StateDrop<T> {
 
 impl<T> Drop for StateDrop<T> {
     fn drop(&mut self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.dropped = None;
         state.notify();
     }
