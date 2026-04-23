@@ -24,17 +24,56 @@ pub struct Subgroups {
     pub track: Arc<Track>,
 }
 
+/// Per-track limits applied to subgroup delivery.
+///
+/// These bound the memory a malicious or misbehaving upstream can consume by
+/// rejecting additional objects / chunks once a subgroup hits its configured
+/// cap. The defaults are intentionally generous for normal live media but
+/// still prevent unbounded growth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubgroupLimits {
+    /// Maximum number of groups retained in the cache.
+    pub max_cached_groups: usize,
+    /// Maximum number of objects retained per subgroup.
+    pub max_objects: usize,
+    /// Maximum number of chunks retained per object.
+    pub max_chunks: usize,
+}
+
+impl SubgroupLimits {
+    pub const fn with_cache_depth(max_cached_groups: usize) -> Self {
+        Self {
+            max_cached_groups,
+            max_objects: DEFAULT_MAX_OBJECTS_PER_SUBGROUP,
+            max_chunks: DEFAULT_MAX_CHUNKS_PER_OBJECT,
+        }
+    }
+}
+
+impl Default for SubgroupLimits {
+    fn default() -> Self {
+        Self {
+            max_cached_groups: DEFAULT_MAX_CACHED_GROUPS,
+            max_objects: DEFAULT_MAX_OBJECTS_PER_SUBGROUP,
+            max_chunks: DEFAULT_MAX_CHUNKS_PER_OBJECT,
+        }
+    }
+}
+
 impl Subgroups {
     pub fn produce(self) -> (SubgroupsWriter, SubgroupsReader) {
-        self.produce_with_cache(DEFAULT_MAX_CACHED_GROUPS)
+        self.produce_with_limits(SubgroupLimits::default())
     }
 
     pub fn produce_with_cache(
         self,
         max_cached_groups: usize,
     ) -> (SubgroupsWriter, SubgroupsReader) {
-        let (cache_writer, cache_reader) =
-            GroupCache::produce(self.track.clone(), max_cached_groups);
+        self.produce_with_limits(SubgroupLimits::with_cache_depth(max_cached_groups))
+    }
+
+    pub fn produce_with_limits(self, limits: SubgroupLimits) -> (SubgroupsWriter, SubgroupsReader) {
+        let (cache_writer, cache_reader) = GroupCache::produce(self.track.clone(), limits);
 
         let writer = SubgroupsWriter::new(cache_writer, self.track.clone());
         let reader = SubgroupsReader::new(cache_reader, self.track);
@@ -51,7 +90,9 @@ impl Deref for Subgroups {
     }
 }
 
-const DEFAULT_MAX_CACHED_GROUPS: usize = 16;
+pub const DEFAULT_MAX_CACHED_GROUPS: usize = 16;
+pub const DEFAULT_MAX_OBJECTS_PER_SUBGROUP: usize = 4096;
+pub const DEFAULT_MAX_CHUNKS_PER_OBJECT: usize = 4096;
 
 pub struct SubgroupsWriter {
     pub info: Arc<Track>,
@@ -111,8 +152,10 @@ impl SubgroupsWriter {
         if inserted {
             self.has_last_group = true;
             self.last_group_id = subgroup.group_id;
-            self.next_group_id = subgroup.group_id + 1;
-            self.next_subgroup_id = subgroup.subgroup_id + 1;
+            // Use saturating_add to avoid panic on attacker-controlled u64 values
+            // arriving from the wire (e.g. group_id == u64::MAX).
+            self.next_group_id = subgroup.group_id.saturating_add(1);
+            self.next_subgroup_id = subgroup.subgroup_id.saturating_add(1);
         }
 
         Ok(writer)
@@ -175,8 +218,7 @@ impl SubgroupsReader {
 
     /// Check if the subgroups writer has been closed or dropped.
     pub fn is_closed(&self) -> bool {
-        let state = self.state.lock();
-        state.closed.is_err() || state.modified().is_none()
+        self.cache.is_closed()
     }
 }
 
@@ -222,10 +264,14 @@ pub struct SubgroupInfo {
 
 impl SubgroupInfo {
     pub fn produce(self) -> (SubgroupWriter, SubgroupReader) {
+        self.produce_with_limits(SubgroupLimits::default())
+    }
+
+    pub fn produce_with_limits(self, limits: SubgroupLimits) -> (SubgroupWriter, SubgroupReader) {
         let (writer, reader) = State::default().split();
         let info = Arc::new(self);
 
-        let writer = SubgroupWriter::new(writer, info.clone());
+        let writer = SubgroupWriter::new(writer, info.clone(), limits);
         let reader = SubgroupReader::new(reader, info);
 
         (writer, reader)
@@ -267,14 +313,18 @@ pub struct SubgroupWriter {
 
     // The next object sequence number to use.
     next_object_id: u64,
+
+    // Per-subgroup limits used to bound memory.
+    limits: SubgroupLimits,
 }
 
 impl SubgroupWriter {
-    fn new(state: State<SubgroupState>, group: Arc<SubgroupInfo>) -> Self {
+    fn new(state: State<SubgroupState>, group: Arc<SubgroupInfo>, limits: SubgroupLimits) -> Self {
         Self {
             state,
             info: group,
             next_object_id: 0,
+            limits,
         }
     }
 
@@ -299,12 +349,20 @@ impl SubgroupWriter {
             status: ObjectStatus::NormalObject,
             size,
             extension_headers: extension_headers.unwrap_or_default(),
+            limits: self.limits,
         }
         .produce();
 
-        self.next_object_id += 1;
+        // Saturating to avoid overflow panic on pathological counters; the
+        // per-subgroup object count cap below is the real bound.
+        self.next_object_id = self.next_object_id.saturating_add(1);
 
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
+
+        if state.objects.len() >= self.limits.max_objects {
+            return Err(ServeError::Size);
+        }
+
         state.objects.push(reader);
 
         Ok(writer)
@@ -434,14 +492,19 @@ pub struct SubgroupObject {
 
     // Extension headers (for draft-14 compliance, particularly immutable extensions)
     pub extension_headers: crate::data::ExtensionHeaders,
+
+    // Per-object limits used to bound chunk buffering memory.
+    #[doc(hidden)]
+    pub limits: SubgroupLimits,
 }
 
 impl SubgroupObject {
     pub fn produce(self) -> (SubgroupObjectWriter, SubgroupObjectReader) {
+        let limits = self.limits;
         let (writer, reader) = State::default().split();
         let info = Arc::new(self);
 
-        let writer = SubgroupObjectWriter::new(writer, info.clone());
+        let writer = SubgroupObjectWriter::new(writer, info.clone(), limits);
         let reader = SubgroupObjectReader::new(reader, info);
 
         (writer, reader)
@@ -483,15 +546,23 @@ pub struct SubgroupObjectWriter {
 
     // The amount of promised data that has yet to be written.
     remain: usize,
+
+    // Per-object chunk limit.
+    limits: SubgroupLimits,
 }
 
 impl SubgroupObjectWriter {
     /// Create a new segment with the given info.
-    fn new(state: State<SubgroupObjectState>, object: Arc<SubgroupObject>) -> Self {
+    fn new(
+        state: State<SubgroupObjectState>,
+        object: Arc<SubgroupObject>,
+        limits: SubgroupLimits,
+    ) -> Self {
         Self {
             state,
             remain: object.size,
             info: object,
+            limits,
         }
     }
 
@@ -503,6 +574,11 @@ impl SubgroupObjectWriter {
         self.remain -= chunk.len();
 
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
+
+        if state.chunks.len() >= self.limits.max_chunks {
+            return Err(ServeError::Size);
+        }
+
         state.chunks.push(chunk);
 
         Ok(())
@@ -750,5 +826,75 @@ mod tests {
             priority: 0,
         });
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn max_group_id_does_not_panic() {
+        let track = make_track();
+        let (mut writer, _reader) = Subgroups { track }.produce();
+
+        // An attacker-controlled group_id == u64::MAX must not panic (debug)
+        // or silently wrap (release). saturating_add keeps next_group_id at MAX.
+        let result = writer.create(Subgroup {
+            group_id: u64::MAX,
+            subgroup_id: u64::MAX,
+            priority: 0,
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn max_objects_limit_rejects_new_objects() {
+        let track = make_track();
+        let limits = SubgroupLimits {
+            max_cached_groups: 2,
+            max_objects: 2,
+            max_chunks: DEFAULT_MAX_CHUNKS_PER_OBJECT,
+        };
+        let (mut writer, _reader) = Subgroups { track }.produce_with_limits(limits);
+
+        let mut subgroup = writer
+            .create(Subgroup {
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+
+        // Two writes should succeed.
+        subgroup.write(Bytes::from_static(b"a")).unwrap();
+        subgroup.write(Bytes::from_static(b"b")).unwrap();
+
+        // Third write must be rejected with Size.
+        let err = subgroup.write(Bytes::from_static(b"c")).unwrap_err();
+        assert!(matches!(err, ServeError::Size));
+    }
+
+    #[test]
+    fn max_chunks_limit_rejects_new_chunks() {
+        let track = make_track();
+        let limits = SubgroupLimits {
+            max_cached_groups: 2,
+            max_objects: DEFAULT_MAX_OBJECTS_PER_SUBGROUP,
+            max_chunks: 2,
+        };
+        let (mut writer, _reader) = Subgroups { track }.produce_with_limits(limits);
+
+        let mut subgroup = writer
+            .create(Subgroup {
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+
+        // Reserve a large object we will fill chunk-by-chunk.
+        let mut object = subgroup.create(6, None).unwrap();
+        object.write(Bytes::from_static(b"aa")).unwrap();
+        object.write(Bytes::from_static(b"bb")).unwrap();
+
+        // Third chunk exceeds max_chunks and must be rejected.
+        let err = object.write(Bytes::from_static(b"cc")).unwrap_err();
+        assert!(matches!(err, ServeError::Size));
     }
 }

@@ -1391,6 +1391,7 @@ version = "0.14.1"
 dependencies = [
  "bytes",
  "futures",
+ "parking_lot",
  "paste",
  "serde",
  "serde_json",
