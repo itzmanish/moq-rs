@@ -152,3 +152,174 @@ impl Drop for Registration {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::NamespaceRegistration;
+    use moq_transport::serve::{Subgroup, TrackReaderMode, Tracks};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn namespace(path: &str) -> TrackNamespace {
+        TrackNamespace::from_utf8_path(path)
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn publisher_teardown_unregisters_namespace_and_drops_tracks_reader_when_idle() {
+        let mut locals = Locals::new();
+        let ns = namespace("teardown/idle");
+
+        let (_, request, reader) = Tracks::new(ns.clone()).produce();
+        let reader_info = Arc::downgrade(&reader.info);
+
+        let registration = locals.register(None, reader.clone()).await.unwrap();
+        let coordinator_dropped = Arc::new(AtomicBool::new(false));
+        let coordinator_registration = NamespaceRegistration::new(DropFlag(coordinator_dropped.clone()));
+
+        assert!(locals.retrieve(None, &ns).is_some());
+
+        drop(registration);
+        drop(coordinator_registration);
+        drop(request);
+        drop(reader);
+
+        assert!(locals.retrieve(None, &ns).is_none());
+        assert!(coordinator_dropped.load(Ordering::SeqCst));
+        assert!(reader_info.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn publisher_teardown_unregisters_namespace_but_existing_subscriber_drains_cache() {
+        let mut locals = Locals::new();
+        let ns = namespace("teardown/active");
+        let track_name = "0.mp4";
+
+        let (_, mut request, mut reader) = Tracks::new(ns.clone()).produce();
+        let reader_info = Arc::downgrade(&reader.info);
+
+        let registration = locals.register(None, reader.clone()).await.unwrap();
+        let coordinator_dropped = Arc::new(AtomicBool::new(false));
+        let coordinator_registration = NamespaceRegistration::new(DropFlag(coordinator_dropped.clone()));
+
+        let track_reader = reader.subscribe(ns.clone(), track_name).unwrap();
+        let track_writer = request.next().await.unwrap();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups_writer
+            .create(Subgroup {
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+
+        subgroup_writer.write(b"init-a".to_vec().into()).unwrap();
+        subgroup_writer.write(b"init-b".to_vec().into()).unwrap();
+
+        let mut subgroups_reader = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(reader) => reader,
+            _ => panic!("unexpected track mode"),
+        };
+
+        drop(subgroup_writer);
+        drop(subgroups_writer);
+        drop(registration);
+        drop(coordinator_registration);
+        drop(request);
+        drop(reader);
+
+        assert!(locals.retrieve(None, &ns).is_none());
+        assert!(coordinator_dropped.load(Ordering::SeqCst));
+        assert!(reader_info.upgrade().is_none());
+
+        let mut subgroup = subgroups_reader.next().await.unwrap().unwrap();
+        assert_eq!(subgroup.group_id, 0);
+
+        let object = subgroup.read_next().await.unwrap().unwrap();
+        assert_eq!(object.as_ref(), b"init-a");
+
+        let object = subgroup.read_next().await.unwrap().unwrap();
+        assert_eq!(object.as_ref(), b"init-b");
+
+        assert!(subgroup.read_next().await.unwrap().is_none());
+        assert!(subgroups_reader.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_subgroup_handles_keeps_cache_alive_until_track_reader_drops() {
+        let mut locals = Locals::new();
+        let ns = namespace("teardown/drop-order");
+        let track_name = "0.mp4";
+
+        let (_, mut request, mut reader) = Tracks::new(ns.clone()).produce();
+
+        let registration = locals.register(None, reader.clone()).await.unwrap();
+        let coordinator_registration = NamespaceRegistration::new(());
+
+        let track_reader = reader.subscribe(ns.clone(), track_name).unwrap();
+        let track_info = Arc::downgrade(&track_reader.info);
+
+        let track_writer = request.next().await.unwrap();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups_writer
+            .create(Subgroup {
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+
+        subgroup_writer.write(b"payload".to_vec().into()).unwrap();
+
+        let mut subgroups_reader = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(reader) => reader,
+            _ => panic!("unexpected track mode"),
+        };
+
+        let mut subgroup = subgroups_reader.next().await.unwrap().unwrap();
+        let subgroup_info = Arc::downgrade(&subgroup.info);
+
+        drop(subgroup_writer);
+        drop(subgroups_writer);
+        drop(registration);
+        drop(coordinator_registration);
+        drop(request);
+        drop(reader);
+
+        let object = subgroup.read_next().await.unwrap().unwrap();
+        assert_eq!(object.as_ref(), b"payload");
+        assert!(subgroup.read_next().await.unwrap().is_none());
+
+        drop(subgroup);
+        drop(subgroups_reader);
+
+        // The namespace-level ownership is gone, but the subscriber-held TrackReader
+        // should still keep the cached subgroup alive.
+        assert!(locals.retrieve(None, &ns).is_none());
+        assert!(subgroup_info.upgrade().is_some());
+        assert!(track_info.upgrade().is_some());
+
+        // A fresh subgroup reader cloned from the still-active TrackReader can still
+        // reach the cached subgroup once more.
+        let mut reopened = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(reader) => reader,
+            _ => panic!("unexpected track mode"),
+        };
+        let subgroup = reopened.next().await.unwrap().unwrap();
+        assert_eq!(subgroup.group_id, 0);
+        drop(subgroup);
+        drop(reopened);
+
+        drop(track_reader);
+
+        assert!(subgroup_info.upgrade().is_none());
+        assert!(track_info.upgrade().is_none());
+    }
+}
