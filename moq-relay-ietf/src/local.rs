@@ -182,7 +182,8 @@ mod tests {
 
         let registration = locals.register(None, reader.clone()).await.unwrap();
         let coordinator_dropped = Arc::new(AtomicBool::new(false));
-        let coordinator_registration = NamespaceRegistration::new(DropFlag(coordinator_dropped.clone()));
+        let coordinator_registration =
+            NamespaceRegistration::new(DropFlag(coordinator_dropped.clone()));
 
         assert!(locals.retrieve(None, &ns).is_some());
 
@@ -207,7 +208,8 @@ mod tests {
 
         let registration = locals.register(None, reader.clone()).await.unwrap();
         let coordinator_dropped = Arc::new(AtomicBool::new(false));
-        let coordinator_registration = NamespaceRegistration::new(DropFlag(coordinator_dropped.clone()));
+        let coordinator_registration =
+            NamespaceRegistration::new(DropFlag(coordinator_dropped.clone()));
 
         let track_reader = reader.subscribe(ns.clone(), track_name).unwrap();
         let track_writer = request.next().await.unwrap();

@@ -15,7 +15,7 @@ use std::{ops::Deref, sync::Arc};
 use bytes::Bytes;
 
 use crate::data::ObjectStatus;
-use crate::serve::{GroupCache, GroupCacheReader, GroupCacheWriter};
+use crate::serve::{DefaultGroupCache, GroupCache, GroupCacheReader, GroupCacheWriter};
 use crate::watch::State;
 
 use super::{ServeError, Track};
@@ -62,22 +62,40 @@ impl Default for SubgroupLimits {
 
 impl Subgroups {
     pub fn produce(self) -> (SubgroupsWriter, SubgroupsReader) {
-        self.produce_with_limits(SubgroupLimits::default())
+        self.produce_with_group_cache(Arc::new(DefaultGroupCache))
     }
 
     pub fn produce_with_cache(
         self,
         max_cached_groups: usize,
     ) -> (SubgroupsWriter, SubgroupsReader) {
-        self.produce_with_limits(SubgroupLimits::with_cache_depth(max_cached_groups))
+        self.produce_with_group_cache_and_limits(
+            Arc::new(DefaultGroupCache),
+            SubgroupLimits::with_cache_depth(max_cached_groups),
+        )
     }
 
     pub fn produce_with_limits(self, limits: SubgroupLimits) -> (SubgroupsWriter, SubgroupsReader) {
-        let (cache_writer, cache_reader) = GroupCache::produce(self.track.clone(), limits);
+        self.produce_with_group_cache_and_limits(Arc::new(DefaultGroupCache), limits)
+    }
 
+    /// Use a custom [`GroupCache`] implementation for this track.
+    pub fn produce_with_group_cache(
+        self,
+        cache: Arc<dyn GroupCache>,
+    ) -> (SubgroupsWriter, SubgroupsReader) {
+        self.produce_with_group_cache_and_limits(cache, SubgroupLimits::default())
+    }
+
+    /// Use a custom [`GroupCache`] implementation with explicit limits.
+    pub fn produce_with_group_cache_and_limits(
+        self,
+        cache: Arc<dyn GroupCache>,
+        limits: SubgroupLimits,
+    ) -> (SubgroupsWriter, SubgroupsReader) {
+        let (cache_writer, cache_reader) = cache.produce(self.track.clone(), limits);
         let writer = SubgroupsWriter::new(cache_writer, self.track.clone());
         let reader = SubgroupsReader::new(cache_reader, self.track);
-
         (writer, reader)
     }
 }
@@ -96,7 +114,7 @@ pub const DEFAULT_MAX_CHUNKS_PER_OBJECT: usize = 4096;
 
 pub struct SubgroupsWriter {
     pub info: Arc<Track>,
-    cache: GroupCacheWriter,
+    cache: Box<dyn GroupCacheWriter>,
     next_subgroup_id: u64, // Not in the state to avoid a lock
     next_group_id: u64,    // Not in the state to avoid a lock
     last_group_id: u64,    // Not in the state to avoid a lock
@@ -104,7 +122,7 @@ pub struct SubgroupsWriter {
 }
 
 impl SubgroupsWriter {
-    fn new(cache: GroupCacheWriter, track: Arc<Track>) -> Self {
+    fn new(cache: Box<dyn GroupCacheWriter>, track: Arc<Track>) -> Self {
         Self {
             info: track,
             cache,
@@ -175,14 +193,22 @@ impl Deref for SubgroupsWriter {
     }
 }
 
-#[derive(Clone)]
 pub struct SubgroupsReader {
     pub info: Arc<Track>,
-    cache: GroupCacheReader,
+    cache: Box<dyn GroupCacheReader>,
+}
+
+impl Clone for SubgroupsReader {
+    fn clone(&self) -> Self {
+        Self {
+            info: self.info.clone(),
+            cache: self.cache.clone_box(),
+        }
+    }
 }
 
 impl SubgroupsReader {
-    fn new(cache: GroupCacheReader, track_info: Arc<Track>) -> Self {
+    fn new(cache: Box<dyn GroupCacheReader>, track_info: Arc<Track>) -> Self {
         Self {
             info: track_info,
             cache,
@@ -204,6 +230,7 @@ impl SubgroupsReader {
             cache: self.cache.reader_from(start_group_id),
         }
     }
+
     pub fn available_rewind_groups(&self) -> u64 {
         self.cache.available_groups()
     }

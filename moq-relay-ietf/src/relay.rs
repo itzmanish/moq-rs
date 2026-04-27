@@ -9,6 +9,8 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic::{self, Endpoint};
 use url::Url;
 
+use moq_transport::serve::{DefaultGroupCache, GroupCache};
+
 use crate::{
     metrics::GaugeGuard, Consumer, Coordinator, Locals, Producer, Remotes, RemotesConsumer,
     RemotesProducer, Session,
@@ -56,6 +58,13 @@ pub struct RelayConfig {
 
     /// The coordinator for namespace/track registration and discovery.
     pub coordinator: Arc<dyn Coordinator>,
+
+    /// Optional custom group cache implementation.
+    ///
+    /// When set, every subgroup-mode track created on this relay will use
+    /// `produce()` on this implementation to create its per-track cache.
+    /// When `None`, [`DefaultGroupCache`] is used.
+    pub group_cache: Option<Arc<dyn GroupCache>>,
 }
 
 /// MoQ Relay server.
@@ -66,6 +75,7 @@ pub struct Relay {
     locals: Locals,
     remotes: Option<(RemotesProducer, RemotesConsumer)>,
     coordinator: Arc<dyn Coordinator>,
+    group_cache: Arc<dyn GroupCache>,
 }
 
 impl Relay {
@@ -115,6 +125,10 @@ impl Relay {
         }
         .produce();
 
+        let group_cache: Arc<dyn GroupCache> = config
+            .group_cache
+            .unwrap_or_else(|| Arc::new(DefaultGroupCache));
+
         Ok(Self {
             quic_endpoints: endpoints,
             announce_url: config.announce,
@@ -122,6 +136,7 @@ impl Relay {
             locals,
             remotes: Some(remotes),
             coordinator: config.coordinator,
+            group_cache,
         })
     }
 
@@ -182,6 +197,7 @@ impl Relay {
                     coordinator,
                     None,
                     forward_scope,
+                    self.group_cache.clone(),
                 )),
                 // Forward connections are always full read-write relay peers,
                 // so no reject loops needed.
@@ -249,6 +265,7 @@ impl Relay {
                     let remotes = remotes.clone();
                     let forward = forward_producer.clone();
                     let coordinator = self.coordinator.clone();
+                    let group_cache = self.group_cache.clone();
 
                     // Spawn a new task to handle the connection
                     tasks.push(async move {
@@ -327,7 +344,7 @@ impl Relay {
                         };
 
                         let (consumer, reject_publishes) = if can_publish {
-                            (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope_id)), None)
+                            (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope_id, group_cache)), None)
                         } else {
                             (None, subscriber)
                         };

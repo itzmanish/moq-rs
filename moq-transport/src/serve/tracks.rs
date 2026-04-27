@@ -16,7 +16,7 @@
 //! The broadcast is automatically closed with [ServeError::Done] when [Writer] is dropped, or all [Reader]s are dropped.
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
-use super::{ServeError, Track, TrackReader, TrackWriter};
+use super::{DefaultGroupCache, GroupCache, ServeError, Track, TrackReader, TrackWriter};
 use crate::coding::TrackNamespace;
 use crate::watch::{Queue, State};
 
@@ -39,13 +39,22 @@ impl Tracks {
     }
 
     pub fn produce(self) -> (TracksWriter, TracksRequest, TracksReader) {
+        self.produce_with_group_cache(Arc::new(DefaultGroupCache))
+    }
+
+    /// Produce with a custom [`GroupCache`] that will be used for every track
+    /// created under this namespace.
+    pub fn produce_with_group_cache(
+        self,
+        group_cache: Arc<dyn GroupCache>,
+    ) -> (TracksWriter, TracksRequest, TracksReader) {
         let info = Arc::new(self);
         let state = State::default().split();
         let queue = Queue::default().split();
 
         let writer = TracksWriter::new(state.0.clone(), info.clone());
         let request = TracksRequest::new(state.0, queue.0, info.clone());
-        let reader = TracksReader::new(state.1, queue.1, info);
+        let reader = TracksReader::new(state.1, queue.1, info, group_cache);
 
         (writer, request, reader)
     }
@@ -164,11 +173,22 @@ pub struct TracksReader {
     state: State<TracksState>,
     queue: Queue<TrackWriter>,
     pub info: Arc<Tracks>,
+    group_cache: Arc<dyn GroupCache>,
 }
 
 impl TracksReader {
-    fn new(state: State<TracksState>, queue: Queue<TrackWriter>, info: Arc<Tracks>) -> Self {
-        Self { state, queue, info }
+    fn new(
+        state: State<TracksState>,
+        queue: Queue<TrackWriter>,
+        info: Arc<Tracks>,
+        group_cache: Arc<dyn GroupCache>,
+    ) -> Self {
+        Self {
+            state,
+            queue,
+            info,
+            group_cache,
+        }
     }
 
     /// Get a track from the broadcast by full name, if it exists and is still alive.
@@ -232,12 +252,14 @@ impl TracksReader {
 
         // Remove the stale track if it exists (it was closed)
         state.tracks.remove(&full_name);
-        // Use the full requested namespace, not self.namespace
+        // Use the full requested namespace, not self.namespace.
+        // Propagate the configured group cache so every track under this
+        // namespace uses the same cache implementation.
         let track_writer_reader = Track {
             namespace: namespace.clone(),
             name: track_name.to_owned(),
         }
-        .produce();
+        .produce_with_group_cache(self.group_cache.clone());
 
         if self.queue.push(track_writer_reader.0).is_err() {
             tracing::debug!(

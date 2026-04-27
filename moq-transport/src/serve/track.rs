@@ -19,8 +19,8 @@
 use crate::watch::State;
 
 use super::{
-    Datagrams, DatagramsReader, DatagramsWriter, ObjectsWriter, ServeError, Stream, StreamReader,
-    StreamWriter, Subgroups, SubgroupsReader, SubgroupsWriter,
+    Datagrams, DatagramsReader, DatagramsWriter, GroupCache, ObjectsWriter, ServeError, Stream,
+    StreamReader, StreamWriter, SubgroupLimits, Subgroups, SubgroupsReader, SubgroupsWriter,
 };
 use crate::coding::{Location, TrackNamespace};
 use paste::paste;
@@ -39,12 +39,19 @@ impl Track {
     }
 
     pub fn produce(self) -> (TrackWriter, TrackReader) {
-        // Create sharable TrackState and Info(Track)
+        self.produce_with_group_cache(Arc::new(super::DefaultGroupCache))
+    }
+
+    /// Produce with a custom [`GroupCache`] that will be used when this track
+    /// is transitioned to subgroup mode.
+    pub fn produce_with_group_cache(
+        self,
+        group_cache: Arc<dyn GroupCache>,
+    ) -> (TrackWriter, TrackReader) {
         let (writer_track_state, reader_track_state) = State::default().split();
         let info = Arc::new(self);
 
-        // Create TrackReader and TrackWriter with shared state and info
-        let writer = TrackWriter::new(writer_track_state, info.clone());
+        let writer = TrackWriter::new(writer_track_state, info.clone(), group_cache);
         let reader = TrackReader::new(reader_track_state, info);
 
         (writer, reader)
@@ -71,12 +78,17 @@ impl Default for TrackState {
 pub struct TrackWriter {
     state: State<TrackState>,
     pub info: Arc<Track>,
+    group_cache: Arc<dyn GroupCache>,
 }
 
 impl TrackWriter {
     /// Create a track with the given name (info/Track)
-    fn new(state: State<TrackState>, info: Arc<Track>) -> Self {
-        Self { state, info }
+    fn new(state: State<TrackState>, info: Arc<Track>, group_cache: Arc<dyn GroupCache>) -> Self {
+        Self {
+            state,
+            info,
+            group_cache,
+        }
     }
 
     /// Create a new stream with the given priority, inserting it into the track.
@@ -104,12 +116,30 @@ impl TrackWriter {
     }
 
     // TODO: rework this whole interface for clarity?
-    /// Create a new subgroups stream with the given priority, inserting it into the track.
+    /// Create a new subgroups stream using the configured group cache.
     pub fn subgroups(self) -> Result<SubgroupsWriter, ServeError> {
+        let cache = self.group_cache.clone();
+        self.subgroups_with_group_cache_and_limits(cache, SubgroupLimits::default())
+    }
+
+    /// Create a new subgroups stream using a custom [`GroupCache`] implementation.
+    pub fn subgroups_with_group_cache(
+        self,
+        cache: Arc<dyn GroupCache>,
+    ) -> Result<SubgroupsWriter, ServeError> {
+        self.subgroups_with_group_cache_and_limits(cache, SubgroupLimits::default())
+    }
+
+    /// Create a new subgroups stream using a custom [`GroupCache`] and explicit limits.
+    pub fn subgroups_with_group_cache_and_limits(
+        self,
+        cache: Arc<dyn GroupCache>,
+        limits: SubgroupLimits,
+    ) -> Result<SubgroupsWriter, ServeError> {
         let (writer, reader) = Subgroups {
             track: self.info.clone(),
         }
-        .produce();
+        .produce_with_group_cache_and_limits(cache, limits);
 
         // Lock state to modify it
         let mut state = self.state.lock_mut().ok_or_else(|| {

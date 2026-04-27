@@ -3,12 +3,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::ops;
+use std::sync::Arc;
 
 use crate::{
     coding::{KeyValuePairs, Location, TrackNamespace},
     data,
     message::{self, FilterType, GroupOrder},
-    serve::{self, ServeError, TrackWriter, TrackWriterMode},
+    serve::{self, DefaultGroupCache, GroupCache, ServeError, TrackWriter, TrackWriterMode},
 };
 
 use crate::watch::State;
@@ -121,6 +122,7 @@ impl Subscribe {
         let recv = SubscribeRecv {
             state: recv,
             writer: Some(track.into()),
+            group_cache: Arc::new(DefaultGroupCache),
         };
 
         (send, recv)
@@ -160,9 +162,18 @@ impl ops::Deref for Subscribe {
 pub(super) struct SubscribeRecv {
     state: State<SubscribeState>,
     writer: Option<TrackWriterMode>,
+    /// Cache implementation to use when transitioning a track writer into
+    /// subgroups mode.  Defaults to [`DefaultGroupCache`] if not configured.
+    group_cache: Arc<dyn GroupCache>,
 }
 
 impl SubscribeRecv {
+    /// Override the group cache used when this track transitions to subgroup mode.
+    pub fn with_group_cache(mut self, cache: Arc<dyn GroupCache>) -> Self {
+        self.group_cache = cache;
+        self
+    }
+
     pub fn ok(&mut self, alias: u64) -> Result<(), ServeError> {
         let state = self.state.lock();
         if state.ok {
@@ -202,9 +213,10 @@ impl SubscribeRecv {
     ) -> Result<serve::SubgroupWriter, ServeError> {
         let writer = self.writer.take().ok_or(ServeError::Done)?;
 
+        let cache = self.group_cache.clone();
         let mut subgroups = match writer {
             // TODO SLG - understand why both of these are needed, clock demo won't run if I comment out TrackWriteMode::Track
-            TrackWriterMode::Track(track) => track.subgroups()?,
+            TrackWriterMode::Track(track) => track.subgroups_with_group_cache(cache)?,
             TrackWriterMode::Subgroups(subgroups) => subgroups,
             _ => return Err(ServeError::Mode),
         };

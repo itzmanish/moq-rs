@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    serve::Tracks,
+    serve::{DefaultGroupCache, GroupCache, Tracks},
     session::{Announced, SessionError, Subscriber},
 };
 
@@ -23,6 +23,9 @@ pub struct Consumer {
     /// Produced by `Coordinator::resolve_scope()` from the connection path.
     /// Passed to coordinator register/lookup calls to isolate namespaces.
     scope: Option<String>,
+    /// Cache implementation used for every subgroup-mode track created
+    /// under this consumer's namespace. Defaults to [`DefaultGroupCache`].
+    group_cache: Arc<dyn GroupCache>,
 }
 
 impl Consumer {
@@ -32,6 +35,7 @@ impl Consumer {
         coordinator: Arc<dyn Coordinator>,
         forward: Option<Producer>,
         scope: Option<String>,
+        group_cache: Arc<dyn GroupCache>,
     ) -> Self {
         Self {
             subscriber,
@@ -39,7 +43,26 @@ impl Consumer {
             coordinator,
             forward,
             scope,
+            group_cache,
         }
+    }
+
+    /// Create a consumer using the default group cache.
+    pub fn new_with_default_cache(
+        subscriber: Subscriber,
+        locals: Locals,
+        coordinator: Arc<dyn Coordinator>,
+        forward: Option<Producer>,
+        scope: Option<String>,
+    ) -> Self {
+        Self::new(
+            subscriber,
+            locals,
+            coordinator,
+            forward,
+            scope,
+            Arc::new(DefaultGroupCache),
+        )
     }
 
     /// Run the consumer to serve announce requests.
@@ -79,8 +102,11 @@ impl Consumer {
 
         let mut tasks = FuturesUnordered::new();
 
-        // Produce the tracks for this announce and return the reader
-        let (_, mut request, reader) = Tracks::new(announce.namespace.clone()).produce();
+        // Produce the tracks for this announce and return the reader.
+        // The group cache is propagated so every track created under this
+        // namespace uses the configured cache implementation.
+        let (_, mut request, reader) = Tracks::new(announce.namespace.clone())
+            .produce_with_group_cache(self.group_cache.clone());
 
         // should we allow the same namespace being served from multiple relays??
         // Manish: NO.
