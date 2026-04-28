@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::{
     collections::{hash_map, HashMap},
     sync::{atomic, Arc, Mutex},
@@ -74,15 +78,17 @@ impl Publisher {
 
     pub async fn accept(
         session: web_transport::Session,
+        transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) = Session::accept(session, None).await?;
+        let (session, publisher, _) = Session::accept(session, None, transport).await?;
         Ok((session, publisher.unwrap()))
     }
 
     pub async fn connect(
         session: web_transport::Session,
+        transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) = Session::connect(session, None).await?;
+        let (session, publisher, _) = Session::connect(session, None, transport).await?;
         Ok((session, publisher))
     }
 
@@ -133,7 +139,7 @@ impl Publisher {
                             subscribe_tasks.push(async move {
                                 let info = subscribed.info.clone();
                                 if let Err(err) = Self::serve_subscribe(subscribed, tracks).await {
-                                    log::warn!("failed serving subscribe: {:?}, error: {}", info, err)
+                                    tracing::warn!("failed serving subscribe: {:?}, error: {}", info, err)
                                 }
                             });
                         },
@@ -149,7 +155,7 @@ impl Publisher {
                             status_tasks.push(async move {
                                 let request_msg = status.request_msg.clone();
                                 if let Err(err) = Self::serve_track_status(status, tracks).await {
-                                    log::warn!("failed serving track status request: {:?}, error: {}", request_msg, err)
+                                    tracing::warn!("failed serving track status request: {:?}, error: {}", request_msg, err)
                                 }
                             });
                         },
@@ -246,7 +252,7 @@ impl Publisher {
         };
 
         if let Err(err) = res {
-            log::warn!("failed to process message: {}", err);
+            tracing::warn!("failed to process message: {}", err);
         }
 
         Ok(())

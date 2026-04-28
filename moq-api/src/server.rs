@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::net;
 
 use axum::{
@@ -37,7 +41,7 @@ impl Server {
     }
 
     pub async fn run(self) -> Result<(), ApiError> {
-        log::info!("connecting to redis: url={}", self.config.redis);
+        tracing::info!("connecting to redis: url={}", self.config.redis);
 
         // Create the redis client.
         let redis = redis::Client::open(self.config.redis)?;
@@ -53,7 +57,7 @@ impl Server {
             )
             .with_state(redis);
 
-        log::info!("serving requests: bind={}", self.config.bind);
+        tracing::info!("serving requests: bind={}", self.config.bind);
 
         let listener = tokio::net::TcpListener::bind(&self.config.bind).await?;
         axum::serve(listener, app.into_make_service()).await?;

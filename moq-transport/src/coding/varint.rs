@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Based on quinn-proto
 // https://github.com/quinn-rs/quinn/blob/main/quinn-proto/src/varint.rs
 // Licensed via Apache 2.0 and MIT
@@ -322,7 +326,7 @@ mod tests {
         assert_eq!(buf.to_vec(), vec![0b0000_0000]); // first 2 bits are 00
         let decoded = VarInt::decode(&mut buf).unwrap();
         assert_eq!(decoded, vi);
-        assert_eq!(u64::try_from(decoded).unwrap(), i);
+        assert_eq!(u64::from(decoded), i);
 
         // 63 -> 1 byte
         let i = 63;
@@ -331,7 +335,7 @@ mod tests {
         assert_eq!(buf.to_vec(), vec![0b0011_1111]); // first 2 bits are 00
         let decoded = VarInt::decode(&mut buf).unwrap();
         assert_eq!(decoded, vi);
-        assert_eq!(u64::try_from(decoded).unwrap(), i);
+        assert_eq!(u64::from(decoded), i);
 
         // 64 -> 2 bytes
         let i = 64;
@@ -340,7 +344,7 @@ mod tests {
         assert_eq!(buf.to_vec(), vec![0b0100_0000, 0b0100_0000]); // first 2 bits are 01
         let decoded = VarInt::decode(&mut buf).unwrap();
         assert_eq!(decoded, vi);
-        assert_eq!(u64::try_from(decoded).unwrap(), i);
+        assert_eq!(u64::from(decoded), i);
 
         // 16383 -> 2 bytes
         let i = 16383;
@@ -349,7 +353,7 @@ mod tests {
         assert_eq!(buf.to_vec(), vec![0b0111_1111, 0xff]); // first 2 bits are 01
         let decoded = VarInt::decode(&mut buf).unwrap();
         assert_eq!(decoded, vi);
-        assert_eq!(u64::try_from(decoded).unwrap(), i);
+        assert_eq!(u64::from(decoded), i);
 
         // 16384 -> 4 bytes
         let i = 16384;
@@ -358,7 +362,7 @@ mod tests {
         assert_eq!(buf.to_vec(), vec![0b1000_0000, 0x00, 0x40, 0x00]); // first 2 bits are 10
         let decoded = VarInt::decode(&mut buf).unwrap();
         assert_eq!(decoded, vi);
-        assert_eq!(u64::try_from(decoded).unwrap(), i);
+        assert_eq!(u64::from(decoded), i);
 
         // 1073741823 -> 4 bytes
         let i = 1073741823;
@@ -367,7 +371,7 @@ mod tests {
         assert_eq!(buf.to_vec(), vec![0b1011_1111, 0xff, 0xff, 0xff]); // first 2 bits are 10
         let decoded = VarInt::decode(&mut buf).unwrap();
         assert_eq!(decoded, vi);
-        assert_eq!(u64::try_from(decoded).unwrap(), i);
+        assert_eq!(u64::from(decoded), i);
 
         // 1073741824 -> 8 bytes
         let i = 1073741824;
@@ -380,7 +384,7 @@ mod tests {
         );
         let decoded = VarInt::decode(&mut buf).unwrap();
         assert_eq!(decoded, vi);
-        assert_eq!(u64::try_from(decoded).unwrap(), i);
+        assert_eq!(u64::from(decoded), i);
 
         // 4611686018427387903 -> 8 bytes
         let i = 4611686018427387903;
@@ -393,7 +397,7 @@ mod tests {
         );
         let decoded = VarInt::decode(&mut buf).unwrap();
         assert_eq!(decoded, vi);
-        assert_eq!(u64::try_from(decoded).unwrap(), i);
+        assert_eq!(u64::from(decoded), i);
     }
 
     #[test]

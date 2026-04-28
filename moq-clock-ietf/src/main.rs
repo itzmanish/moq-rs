@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use moq_native_ietf::quic;
 
 use anyhow::Context;
@@ -17,26 +20,27 @@ use moq_transport::{
 /// The main entry point for the MoQ Clock IETF example.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
-
-    // Disable tracing so we don't get a bunch of Quinn spam.
-    let tracer = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    tracing::subscriber::set_global_default(tracer).unwrap();
+    // Initialize tracing with env filter (respects RUST_LOG environment variable)
+    // Default to info level, but suppress quinn's verbose output
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
+        )
+        .init();
 
     let config = Cli::parse();
     let tls = config.tls.load()?;
 
     // Create the QUIC endpoint
-    let quic = quic::Endpoint::new(quic::Config::new(config.bind, None, tls))?;
+    let quic = quic::Endpoint::new(quic::Config::new(config.bind, None, tls)?)?;
 
-    log::info!("connecting to server: url={}", config.url);
+    tracing::info!("connecting to server: url={}", config.url);
 
     // Connect to the server
-    let (session, connection_id) = quic.client.connect(&config.url, None).await?;
+    let (session, connection_id, transport) = quic.client.connect(&config.url, None).await?;
 
-    log::info!(
+    tracing::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
         connection_id
     );
@@ -44,12 +48,12 @@ async fn main() -> anyhow::Result<()> {
     // Depending on whether we are publishing or subscribing, create the appropriate session
     if config.publish {
         // Create the publisher session
-        let (session, mut publisher) = Publisher::connect(session)
+        let (session, mut publisher) = Publisher::connect(session, transport)
             .await
             .context("failed to create MoQ Transport session")?;
 
         if config.datagrams {
-            log::info!("publishing clock via datagrams");
+            tracing::info!("publishing clock via datagrams");
 
             let (mut tracks_writer, _, tracks_reader) = serve::Tracks {
                 namespace: TrackNamespace::from_utf8_path(&config.namespace),
@@ -65,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
                 res = publisher.announce(tracks_reader) => res.context("failed to serve tracks")?,
             }
         } else {
-            log::info!("publishing clock via streams");
+            tracing::info!("publishing clock via streams");
 
             let (mut tracks_writer, _, tracks_reader) = serve::Tracks {
                 namespace: TrackNamespace::from_utf8_path(&config.namespace),
@@ -83,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         // Create the subscriber session
-        let (session, mut subscriber) = Subscriber::connect(session)
+        let (session, mut subscriber) = Subscriber::connect(session, transport)
             .await
             .context("failed to create MoQ Transport session")?;
 

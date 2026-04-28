@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::{net, path::PathBuf, sync::Arc};
 
 use axum::{
@@ -59,13 +62,13 @@ impl Web {
         // Optionally add qlog serving endpoint
         if state.qlog_dir.is_some() {
             app = app.route("/qlog/:cid", get(serve_qlog));
-            log::info!("qlog files available at /qlog/:cid");
+            tracing::info!("qlog files available at /qlog/:cid");
         }
 
         // Optionally add mlog serving endpoint
         if state.mlog_dir.is_some() {
             app = app.route("/mlog/:cid", get(serve_mlog));
-            log::info!("mlog files available at /mlog/:cid");
+            tracing::info!("mlog files available at /mlog/:cid");
         }
 
         // Add state and CORS layer

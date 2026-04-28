@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use std::fmt;
 
@@ -57,14 +60,14 @@ impl Decode for KeyValuePair {
         if key % 2 == 0 {
             // VarInt variant
             let value = u64::decode(r)?;
-            log::trace!("[KVP] Decoded even key={}, value={}", key, value);
+            tracing::trace!("[KVP] Decoded even key={}, value={}", key, value);
             Ok(KeyValuePair::new_int(key, value))
         } else {
             // Bytes variant
             let length = usize::decode(r)?;
-            log::trace!("[KVP] Decoded odd key={}, length={}", key, length);
+            tracing::trace!("[KVP] Decoded odd key={}, length={}", key, length);
             if length > u16::MAX as usize {
-                log::error!(
+                tracing::error!(
                     "[KVP] Length exceeded! key={}, length={} (max={})",
                     key,
                     length,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! A stream is a stream of objects with a header, split into a [Writer] and [Reader] handle.
 //!
 //! A [Writer] writes an ordered stream of objects.
@@ -198,6 +201,12 @@ impl SubgroupsReader {
             .latest_subgroup_reader
             .as_ref()
             .map(|group| (group.group_id, group.latest()))
+    }
+
+    /// Check if the subgroups writer has been closed or dropped.
+    pub fn is_closed(&self) -> bool {
+        let state = self.state.lock();
+        state.closed.is_err() || state.modified().is_none()
     }
 }
 

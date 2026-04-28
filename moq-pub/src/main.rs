@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use bytes::BytesMut;
 use std::net;
 use url::Url;
@@ -41,13 +45,14 @@ pub struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
-
-    // Disable tracing so we don't get a bunch of Quinn spam.
-    let tracer = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    tracing::subscriber::set_global_default(tracer).unwrap();
+    // Initialize tracing with env filter (respects RUST_LOG environment variable)
+    // Default to info level, but suppress quinn's verbose output
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
+        )
+        .init();
 
     let cli = Cli::parse();
 
@@ -61,17 +66,17 @@ async fn main() -> anyhow::Result<()> {
         cli.bind,
         None,
         tls.clone(),
-    ))?;
+    )?)?;
 
-    log::info!("connecting to relay: url={}", cli.url);
-    let (session, connection_id) = quic.client.connect(&cli.url, None).await?;
+    tracing::info!("connecting to relay: url={}", cli.url);
+    let (session, connection_id, transport) = quic.client.connect(&cli.url, None).await?;
 
-    log::info!(
+    tracing::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
         connection_id
     );
 
-    let (session, mut publisher) = Publisher::connect(session)
+    let (session, mut publisher) = Publisher::connect(session, transport)
         .await
         .context("failed to create MoQ Transport publisher")?;
 

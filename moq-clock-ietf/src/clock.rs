@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use anyhow::Context;
 use moq_transport::serve::{
     Datagram, DatagramsReader, DatagramsWriter, StreamReader, Subgroup, SubgroupWriter,
@@ -51,7 +54,7 @@ impl Publisher {
                 // Spawn a new task to handle sending the object every second
                 tokio::spawn(async move {
                     if let Err(err) = Self::send_subgroup_objects(subgroup_writer, now).await {
-                        log::warn!("failed to send minute: {:?}", err);
+                        tracing::warn!("failed to send minute: {:?}", err);
                     }
                 });
 

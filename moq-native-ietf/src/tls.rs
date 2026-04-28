@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use anyhow::Context;
 use clap::Parser;
 use ring::digest::{digest, SHA256};
@@ -37,7 +40,7 @@ pub struct Args {
     /// Danger: Disable TLS certificate verification.
     ///
     /// Fine for local development and between relays, but should be used in caution in production.
-    #[arg(long = "tls-disable-verify")]
+    #[arg(long = "tls-disable-verify", env = "TLS_DISABLE_VERIFY")]
     pub disable_verify: bool,
 }
 

@@ -1,4 +1,8 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -9,7 +13,13 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::Coordinator;
+use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError};
+
+/// Cache key for upstream relay-to-relay connections.
+///
+/// Keyed by both URL and destination address so that connections are reused
+/// only when both match.
+type RemoteCacheKey = (Url, Option<SocketAddr>);
 
 /// Manages connections to remote relays.
 ///
@@ -20,7 +30,7 @@ use crate::Coordinator;
 pub struct RemoteManager {
     coordinator: Arc<dyn Coordinator>,
     clients: Vec<quic::Client>,
-    remotes: Arc<Mutex<HashMap<Url, Remote>>>,
+    remotes: Arc<Mutex<HashMap<RemoteCacheKey, Remote>>>,
 }
 
 impl RemoteManager {
@@ -35,52 +45,49 @@ impl RemoteManager {
 
     /// Subscribe to a track from a remote relay.
     ///
-    /// This will:
-    /// 1. Use the coordinator to lookup which relay serves the namespace
-    /// 2. Connect to that relay if not already connected
-    /// 3. Subscribe to the specific track
+    /// `scope` is the resolved scope identity from `Coordinator::resolve_scope()`,
+    /// passed through to the coordinator's `lookup()` to scope the search.
     ///
     /// Returns None if the namespace isn't found in any remote relay.
     pub async fn subscribe(
         &self,
+        scope: Option<&str>,
         namespace: &TrackNamespace,
         track_name: &str,
     ) -> anyhow::Result<Option<TrackReader>> {
-        // Ask coordinator where this namespace lives
-        let (origin, client) = match self.coordinator.lookup(namespace).await {
-            Ok((origin, client)) => (origin, client),
-            Err(e) => {
-                log::error!("failed to lookup namespace: {}", e);
-                return Ok(None); // Namespace not found anywhere
-            }
+        let (origin, client) = match self.coordinator.lookup(scope, namespace).await {
+            Ok(result) => result,
+            Err(CoordinatorError::NamespaceNotFound) => return Ok(None),
+            Err(err) => return Err(err.into()),
         };
 
         let url = origin.url();
+        let cache_key = (url.clone(), origin.addr());
 
-        // Get or create a connection to the remote relay
-        let remote = match self.get_or_connect(&url, client.as_ref()).await {
+        let remote = match self
+            .get_or_connect(cache_key.clone(), client.as_ref())
+            .await
+        {
             Ok(remote) => remote,
-            Err(e) => {
-                log::error!("failed to connect to remote relay {}: {}", url, e);
-                // Remove failed connection from cache
-                self.remove(&url).await;
-                return Err(e);
+            Err(err) => {
+                tracing::error!(remote_url = %url, error = %err, "failed to connect to remote relay: {}", err);
+                self.remove(&cache_key).await;
+                return Err(err);
             }
         };
 
-        // Subscribe to the track on the remote
         match remote
             .subscribe(namespace.clone(), track_name.to_string())
             .await
         {
             Ok(reader) => Ok(reader),
-            Err(e) => {
-                // If subscription fails, check if connection is dead and remove it
+            Err(err) => {
                 if !remote.is_connected() {
-                    log::warn!("remote connection {} is dead, removing from cache", url);
-                    self.remove(&url).await;
+                    tracing::warn!(remote_url = %url, "remote connection is dead, removing from cache");
+                    self.remove(&cache_key).await;
                 }
-                Err(e)
+
+                Err(err)
             }
         }
     }
@@ -88,43 +95,38 @@ impl RemoteManager {
     /// Get an existing remote connection or create a new one.
     async fn get_or_connect(
         &self,
-        url: &Url,
+        cache_key: RemoteCacheKey,
         client: Option<&quic::Client>,
     ) -> anyhow::Result<Remote> {
         let mut remotes = self.remotes.lock().await;
 
-        // Check if we already have a connection
-        if let Some(remote) = remotes.get(url) {
+        if let Some(remote) = remotes.get(&cache_key) {
             if remote.is_connected() {
                 return Ok(remote.clone());
             }
-            // Connection is dead, remove it
-            log::info!("removing dead connection to remote relay: {}", url);
-            remotes.remove(url);
+
+            tracing::info!(remote_url = %cache_key.0, "removing dead connection to remote relay");
+            remotes.remove(&cache_key);
         }
 
-        // Get client, with proper error handling for empty clients vec
         let client = match client {
-            Some(c) => c,
+            Some(client) => client,
             None => self.clients.first().ok_or_else(|| {
                 anyhow::anyhow!("no QUIC clients configured for remote connections")
             })?,
         };
 
-        // Create a new connection with its own QUIC client
-        log::info!("connecting to remote relay: {}", url);
-        let remote = Remote::connect(url.clone(), client).await?;
-
-        remotes.insert(url.clone(), remote.clone());
+        tracing::info!(remote_url = %cache_key.0, "connecting to remote relay");
+        let remote = Remote::connect(cache_key.0.clone(), cache_key.1, client).await?;
+        remotes.insert(cache_key, remote.clone());
 
         Ok(remote)
     }
 
     /// Remove a remote connection (called when connection fails).
-    pub async fn remove(&self, url: &Url) {
+    async fn remove(&self, cache_key: &RemoteCacheKey) {
         let mut remotes = self.remotes.lock().await;
-        if let Some(remote) = remotes.remove(url) {
-            // Cancel the session task when removing
+        if let Some(remote) = remotes.remove(cache_key) {
             remote.shutdown();
         }
     }
@@ -132,8 +134,8 @@ impl RemoteManager {
     /// Shutdown all remote connections.
     pub async fn shutdown(&self) {
         let mut remotes = self.remotes.lock().await;
-        for (url, remote) in remotes.drain() {
-            log::info!("shutting down remote connection: {}", url);
+        for (cache_key, remote) in remotes.drain() {
+            tracing::info!(remote_url = %cache_key.0, "shutting down remote connection");
             remote.shutdown();
         }
     }
@@ -154,33 +156,54 @@ pub struct Remote {
 
 impl Remote {
     /// Connect to a remote relay with a dedicated QUIC client.
-    async fn connect(url: Url, client: &quic::Client) -> anyhow::Result<Self> {
-        // Connect to the remote relay (DNS resolution happens inside connect)
-        let (session, _cid) = client.connect(&url, None).await?;
-        let (session, subscriber) = moq_transport::session::Subscriber::connect(session).await?;
+    async fn connect(
+        url: Url,
+        addr: Option<SocketAddr>,
+        client: &quic::Client,
+    ) -> anyhow::Result<Self> {
+        let (session, _quic_client_initial_cid, transport) = match client.connect(&url, addr).await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
+                    .increment(1);
+                return Err(err);
+            }
+        };
+
+        let (session, subscriber) =
+            match moq_transport::session::Subscriber::connect(session, transport).await {
+                Ok(session) => session,
+                Err(err) => {
+                    metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
+                        .increment(1);
+                    return Err(err.into());
+                }
+            };
 
         let connected = Arc::new(AtomicBool::new(true));
         let cancel = CancellationToken::new();
+        let upstream_guard = GaugeGuard::new("moq_relay_upstream_connections");
 
-        // Spawn a task to run the session
         let session_url = url.clone();
         let session_connected = connected.clone();
         let session_cancel = cancel.clone();
 
         tokio::spawn(async move {
+            let _upstream_guard = upstream_guard;
             tokio::select! {
                 result = session.run() => {
                     if let Err(err) = result {
-                        log::warn!("remote session closed: {} - {}", session_url, err);
+                        tracing::warn!(remote_url = %session_url, error = %err, "remote session closed: {}", err);
                     } else {
-                        log::info!("remote session closed normally: {}", session_url);
+                        tracing::info!(remote_url = %session_url, "remote session closed normally");
                     }
                 }
                 _ = session_cancel.cancelled() => {
-                    log::info!("remote session cancelled: {}", session_url);
+                    tracing::info!(remote_url = %session_url, "remote session cancelled");
                 }
             }
-            // Mark connection as dead
+
             session_connected.store(false, Ordering::Release);
         });
 
@@ -210,67 +233,34 @@ impl Remote {
         namespace: TrackNamespace,
         track_name: String,
     ) -> anyhow::Result<Option<TrackReader>> {
-        // Check connection state first
         if !self.is_connected() {
-            return Err(anyhow::anyhow!(
-                "remote connection to {} is closed",
-                self.url
-            ));
+            anyhow::bail!("remote connection to {} is closed", self.url);
         }
 
         let key = (namespace.clone(), track_name.clone());
-
-        // Hold lock for entire check-and-insert to prevent race conditions
         let mut tracks = self.tracks.lock().await;
 
-        // Check if we already have this track
         if let Some(reader) = tracks.get(&key) {
             return Ok(Some(reader.clone()));
         }
 
-        // Create a new track and subscribe
-        let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
-
-        // Insert BEFORE spawning to prevent race with removal in the spawned task
+        let (writer, reader) = Track::new(namespace, track_name).produce();
         tracks.insert(key.clone(), reader.clone());
-
-        // Drop lock before spawning async task
         drop(tracks);
 
-        // Subscribe to the track on the remote
         let mut subscriber = self.subscriber.clone();
-        let track_key = key;
-        let tracks_clone = self.tracks.clone();
+        let tracks = self.tracks.clone();
         let url = self.url.clone();
 
         tokio::spawn(async move {
-            log::info!(
-                "subscribing to remote track: {} - {}/{}",
-                url,
-                track_key.0,
-                track_key.1
-            );
+            tracing::info!(remote_url = %url, namespace = %key.0, track = %key.1, "subscribing to remote track");
 
             if let Err(err) = subscriber.subscribe(writer).await {
-                log::warn!(
-                    "failed subscribing to remote track: {} - {}/{} - {}",
-                    url,
-                    track_key.0,
-                    track_key.1,
-                    err
-                );
-                // NOTE(itzmanish): should we assume the connection is bad?
-                // connected.store(false, Ordering::Release);
+                tracing::warn!(remote_url = %url, namespace = %key.0, track = %key.1, error = %err, "failed subscribing to remote track: {}", err);
             }
 
-            // Remove track from map when subscription ends
-            tracks_clone.lock().await.remove(&track_key);
-            log::debug!(
-                "remote track subscription ended: {} - {}/{}",
-                url,
-                track_key.0,
-                track_key.1
-            );
+            tracks.lock().await.remove(&key);
+            tracing::debug!(remote_url = %url, namespace = %key.0, track = %key.1, "remote track subscription ended");
         });
 
         Ok(Some(reader))

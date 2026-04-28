@@ -1,7 +1,10 @@
+// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::{io::Cursor, sync::Arc};
 
 use anyhow::Context;
-use log::{debug, info, trace, warn};
 use moq_transport::serve::{
     SubgroupObjectReader, SubgroupReader, TrackReader, TrackReaderMode, Tracks, TracksReader,
     TracksWriter,
@@ -13,6 +16,7 @@ use tokio::{
     sync::Mutex,
     task::JoinSet,
 };
+use tracing::{debug, info, trace, warn};
 
 pub struct Media<O> {
     subscriber: Subscriber,
