@@ -26,6 +26,7 @@ pub(crate) enum PendingRequest {
     PublishNamespace,
     Publish,
     Subscribe,
+    Fetch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +35,7 @@ pub(crate) enum PendingResponse {
     RequestError,
     PublishOk,
     SubscribeOk,
+    FetchOk,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -55,6 +57,9 @@ impl PendingRequest {
             ) | (
                 Self::Subscribe,
                 PendingResponse::SubscribeOk | PendingResponse::RequestError,
+            ) | (
+                Self::Fetch,
+                PendingResponse::FetchOk | PendingResponse::RequestError,
             )
         )
     }
@@ -135,5 +140,19 @@ impl PendingRequests {
 
     pub(crate) async fn changed(&self) {
         self.notify.notified().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetch_accepts_only_fetch_ok_or_request_error() {
+        assert!(PendingRequest::Fetch.accepts(PendingResponse::FetchOk));
+        assert!(PendingRequest::Fetch.accepts(PendingResponse::RequestError));
+        assert!(!PendingRequest::Fetch.accepts(PendingResponse::RequestOk));
+        assert!(!PendingRequest::Fetch.accepts(PendingResponse::PublishOk));
+        assert!(!PendingRequest::Fetch.accepts(PendingResponse::SubscribeOk));
     }
 }

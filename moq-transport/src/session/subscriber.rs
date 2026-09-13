@@ -22,9 +22,11 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    OpenSubscribeNamespace, PendingRequest, PendingRequests, PublishReceived, PublishReceivedRecv,
-    PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, RequestIdAllocation, Session,
-    SessionConfig, SessionError, SessionId, Subscribe, SubscribeNamespace, SubscribeRecv,
+    fetch_requested::{fetch_end_in_range, inclusive_end},
+    Fetch, FetchRecv, OpenSubscribeNamespace, PendingRequest, PendingRequests, PendingResponse,
+    PublishReceived, PublishReceivedRecv, PublishedNamespace, PublishedNamespaceRecv, Reader,
+    RequestId, RequestIdAllocation, Session, SessionConfig, SessionError, SessionId, Subscribe,
+    SubscribeNamespace, SubscribeRecv,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -44,6 +46,9 @@ pub struct Subscriber {
 
     /// Outbound TRACK_STATUS requests awaiting a shared REQUEST_OK / REQUEST_ERROR response.
     track_statuses: Arc<Mutex<HashSet<u64>>>,
+
+    /// Active outbound FETCH requests, keyed by request ID.
+    fetches: Arc<Mutex<HashMap<u64, FetchRecv>>>,
 
     /// Unified map of Track Alias → owning subscription (draft-16 §10.1).
     ///
@@ -238,6 +243,7 @@ impl Subscriber {
             published_namespace_queue: Default::default(),
             subscribes: Default::default(),
             track_statuses: Default::default(),
+            fetches: Default::default(),
             track_alias_map: Default::default(),
             track_alias_notify: Arc::new(Notify::new()),
             publishes_received: Default::default(),
@@ -613,6 +619,41 @@ impl Subscriber {
         Ok(send)
     }
 
+    pub fn fetch(
+        &mut self,
+        standalone: message::StandaloneFetch,
+        params: KeyValuePairs,
+    ) -> Result<Fetch, ServeError> {
+        if standalone.start_location > inclusive_end(standalone.end_location) {
+            return Err(ServeError::Size);
+        }
+        let id = self
+            .get_next_request_id()
+            .map_err(|err| ServeError::internal_ctx(format!("request ID limit: {err}")))?;
+        self.pending_requests
+            .insert(id, PendingRequest::Fetch)
+            .map_err(|err| ServeError::internal_ctx(format!("pending FETCH: {err}")))?;
+        let request = message::Fetch {
+            id,
+            fetch_type: message::FetchType::Standalone,
+            standalone_fetch: Some(standalone),
+            joining_fetch: None,
+            params,
+        };
+        let (fetch, recv) = Fetch::new(self.clone(), request.clone());
+        if self
+            .fetches
+            .lock()
+            .map(|mut fetches| fetches.insert(id, recv))
+            .is_err()
+        {
+            let _ = self.pending_requests.remove(id);
+            return Err(ServeError::internal_ctx("fetch lock poisoned"));
+        }
+        self.send_message(request);
+        Ok(fetch)
+    }
+
     /// Send a message to the publisher via the control stream.
     pub(super) fn send_message<M: Into<message::Subscriber>>(&mut self, msg: M) {
         let msg = msg.into();
@@ -645,18 +686,56 @@ impl Subscriber {
             // Draft-16 shared responses (REQUEST_OK / REQUEST_ERROR).
             message::Publisher::RequestOk(msg) => self.recv_request_ok(msg)?,
             message::Publisher::RequestError(msg) => self.recv_request_error(msg)?,
-            // FETCH_OK is part of draft-16, but FETCH is not implemented here yet.
-            message::Publisher::FetchOk(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    session_id = %self.session_id,
-                    request_id = msg.id,
-                    "received FETCH_OK for unsupported FETCH — ignoring"
-                );
-            }
+            message::Publisher::FetchOk(msg) => self.recv_fetch_ok(msg)?,
         }
 
         Ok(())
+    }
+
+    fn recv_fetch_ok(&mut self, msg: &message::FetchOk) -> Result<(), SessionError> {
+        if self
+            .fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get(&msg.id)
+            .is_some_and(|fetch| !fetch_end_in_range(fetch.start, fetch.end, msg.end_location))
+        {
+            return Err(SessionError::ProtocolViolation(
+                "FETCH_OK end location is outside the requested range".to_string(),
+            ));
+        }
+        let request = self
+            .pending_requests
+            .complete(msg.id, PendingResponse::FetchOk)?;
+        if request != Some(PendingRequest::Fetch) {
+            if self
+                .fetches
+                .lock()
+                .map_err(|_| SessionError::Internal)?
+                .contains_key(&msg.id)
+            {
+                return Err(SessionError::ProtocolViolation(
+                    "received duplicate FETCH_OK".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        if let Some(fetch) = self
+            .fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get_mut(&msg.id)
+        {
+            fetch.recv_ok(msg)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn remove_fetch(&mut self, id: u64) {
+        let _ = self.pending_requests.remove(id);
+        if let Ok(mut fetches) = self.fetches.lock() {
+            fetches.remove(&id);
+        }
     }
 
     /// Handle reception of an inbound PUBLISH_NAMESPACE from the publisher.
@@ -984,6 +1063,16 @@ impl Subscriber {
         &mut self,
         msg: &message::RequestError,
     ) -> Result<(), SessionError> {
+        let fetch = self
+            .fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .remove(&msg.id);
+        if let Some(mut fetch) = fetch {
+            fetch.recv_error(msg)?;
+            return Ok(());
+        }
+
         // Route to a matching SUBSCRIBE if present.
         if let Some(subscribe) = self.remove_subscribe(msg.id) {
             self.log_request_error_parsed("subscribe", msg);
@@ -1037,6 +1126,17 @@ impl Subscriber {
             PendingRequest::Subscribe => {
                 if let Some(subscribe) = self.remove_subscribe(id) {
                     subscribe.error(ServeError::internal_ctx("SUBSCRIBE response timed out"))?;
+                }
+            }
+            PendingRequest::Fetch => {
+                let fetch = self
+                    .fetches
+                    .lock()
+                    .map_err(|_| SessionError::Internal)?
+                    .remove(&id);
+                if let Some(mut fetch) = fetch {
+                    self.send_message(message::FetchCancel { id });
+                    fetch.recv_timeout(ServeError::internal_ctx("FETCH response timed out"))?;
                 }
             }
             PendingRequest::PublishNamespace | PendingRequest::Publish => {
@@ -1136,7 +1236,27 @@ impl Subscriber {
             stream_header.header_type
         );
 
-        // No fetch support yet
+        if stream_header.header_type.is_fetch() {
+            let fetch = stream_header.fetch_header.ok_or(SessionError::Internal)?;
+            let mut fetches = self.fetches.lock().map_err(|_| SessionError::Internal)?;
+            let recv = fetches.get_mut(&fetch.request_id).ok_or_else(|| {
+                SessionError::Serve(ServeError::not_found_ctx(format!(
+                    "fetch request {} not found",
+                    fetch.request_id
+                )))
+            })?;
+            recv.recv_stream(reader).map_err(|err| {
+                if err == ServeError::Duplicate {
+                    SessionError::ProtocolViolation(
+                        "received multiple streams for one FETCH".to_string(),
+                    )
+                } else {
+                    err.into()
+                }
+            })?;
+            return Ok(());
+        }
+
         if !stream_header.header_type.is_subgroup() {
             return Err(SessionError::unimplemented("non-SUBGROUP stream types"));
         }
@@ -1581,6 +1701,162 @@ mod tests {
             params: Default::default(),
             track_extensions: Default::default(),
         }
+    }
+
+    fn standalone_fetch(track: &str) -> message::StandaloneFetch {
+        message::StandaloneFetch {
+            track_namespace: TrackNamespace::from_utf8_path("test"),
+            track_name: TrackName::from(track),
+            start_location: crate::coding::Location::new(0, 0),
+            end_location: crate::coding::Location::new(1, 0),
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_fetch_preserves_request_and_allocates_fresh_ids() {
+        let mut subscriber = subscriber();
+        let mut outgoing = subscriber.outgoing.clone();
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(2, 7);
+
+        let first = subscriber
+            .fetch(standalone_fetch("video"), params.clone())
+            .unwrap();
+        let second = subscriber
+            .fetch(standalone_fetch("video"), params.clone())
+            .unwrap();
+
+        let Message::Fetch(first_request) = outgoing.pop().await.unwrap() else {
+            panic!("expected first FETCH");
+        };
+        let Message::Fetch(second_request) = outgoing.pop().await.unwrap() else {
+            panic!("expected second FETCH");
+        };
+        assert_eq!(
+            first_request.standalone_fetch,
+            Some(standalone_fetch("video"))
+        );
+        assert_eq!(first_request.params, params);
+        assert_eq!(first_request.id, first.request.id);
+        assert_eq!(second_request.id, second.request.id);
+        assert_ne!(first_request.id, second_request.id);
+    }
+
+    #[tokio::test]
+    async fn dropping_fetch_sends_one_cancel_and_removes_state() {
+        let mut subscriber = subscriber();
+        let mut outgoing = subscriber.outgoing.clone();
+        let mut fetch = subscriber
+            .fetch(standalone_fetch("video"), KeyValuePairs::default())
+            .unwrap();
+        let Message::Fetch(request) = outgoing.pop().await.unwrap() else {
+            panic!("expected FETCH");
+        };
+        fetch.request.id = 98;
+
+        drop(fetch);
+
+        let Message::FetchCancel(cancel) = outgoing.pop().await.unwrap() else {
+            panic!("expected FETCH_CANCEL");
+        };
+        assert_eq!(cancel.id, request.id);
+        assert!(subscriber.fetches.lock().unwrap().is_empty());
+        assert!(outgoing.close().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_ok_is_correlated_and_duplicates_are_rejected() {
+        let mut subscriber = subscriber();
+        let mut outgoing = subscriber.outgoing.clone();
+        let fetch = subscriber
+            .fetch(standalone_fetch("video"), KeyValuePairs::default())
+            .unwrap();
+        let Message::Fetch(request) = outgoing.pop().await.unwrap() else {
+            panic!("expected FETCH");
+        };
+        let response = message::FetchOk {
+            id: request.id,
+            end_of_track: true,
+            end_location: crate::coding::Location::new(1, 0),
+            params: Default::default(),
+            track_extensions: Default::default(),
+        };
+
+        subscriber.recv_fetch_ok(&response).unwrap();
+
+        assert_eq!(fetch.ok().await.unwrap(), response);
+        assert!(matches!(
+            subscriber.recv_fetch_ok(&response),
+            Err(SessionError::ProtocolViolation(_))
+        ));
+    }
+
+    #[test]
+    fn fetch_ok_outside_requested_range_is_rejected() {
+        let mut subscriber = subscriber();
+        let fetch = subscriber
+            .fetch(standalone_fetch("video"), KeyValuePairs::default())
+            .unwrap();
+
+        assert!(matches!(
+            subscriber.recv_fetch_ok(&message::FetchOk {
+                id: fetch.request.id,
+                end_of_track: false,
+                end_location: crate::coding::Location::new(2, 0),
+                params: Default::default(),
+                track_extensions: Default::default(),
+            }),
+            Err(SessionError::ProtocolViolation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_error_preserves_details_and_suppresses_cancel() {
+        let mut subscriber = subscriber();
+        let mut outgoing = subscriber.outgoing.clone();
+        let fetch = subscriber
+            .fetch(standalone_fetch("missing"), KeyValuePairs::default())
+            .unwrap();
+        let Message::Fetch(request) = outgoing.pop().await.unwrap() else {
+            panic!("expected FETCH");
+        };
+        let expected =
+            message::RequestError::new(request.id, RequestErrorCode::DoesNotExist, 42, "not here");
+        subscriber
+            .pending_requests
+            .complete(request.id, PendingResponse::RequestError)
+            .unwrap();
+
+        subscriber.recv_request_error(&expected).unwrap();
+
+        assert_eq!(fetch.request_error(), Some(expected));
+        assert!(fetch.ok().await.is_err());
+        drop(fetch);
+        assert!(outgoing.close().is_empty());
+    }
+
+    #[tokio::test]
+    async fn timed_out_fetch_sends_one_cancel() {
+        let mut subscriber = subscriber();
+        let mut outgoing = subscriber.outgoing.clone();
+        let fetch = subscriber
+            .fetch(standalone_fetch("slow"), KeyValuePairs::default())
+            .unwrap();
+        let Message::Fetch(request) = outgoing.pop().await.unwrap() else {
+            panic!("expected FETCH");
+        };
+
+        subscriber
+            .recv_request_timeout(request.id, PendingRequest::Fetch)
+            .unwrap();
+
+        let Message::FetchCancel(cancel) = outgoing.pop().await.unwrap() else {
+            panic!("expected FETCH_CANCEL");
+        };
+        assert_eq!(cancel.id, request.id);
+        assert!(fetch.ok().await.is_err());
+        drop(fetch);
+        assert!(outgoing.close().is_empty());
     }
 
     #[tokio::test]
