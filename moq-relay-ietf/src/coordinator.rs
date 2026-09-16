@@ -555,6 +555,9 @@ pub trait Coordinator: Send + Sync {
     ///
     /// - `Ok(NamespaceOrigin, Option<quic::Client>)` - Namespace origin and optional client if available
     /// - `Err` - Namespace not found anywhere
+    ///
+    /// The returned URL must be complete and dialable, and its path must establish
+    /// a session that resolves to the requested scope.
     async fn lookup(
         &self,
         scope: Option<&str>,

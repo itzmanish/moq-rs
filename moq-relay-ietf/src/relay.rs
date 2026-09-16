@@ -49,7 +49,7 @@ pub struct RelayConfig {
     /// Forward all PUBLISH_NAMESPACE messages to the (optional) upstream URL.
     pub announce: Option<Url>,
 
-    /// Our hostname which we advertise to other origins.
+    /// Our hostname which we advertise to other origins and use to reject self-routes.
     /// We use QUIC, so the certificate must be valid for this address.
     pub node: Option<Url>,
 
@@ -64,7 +64,8 @@ pub struct RelayConfig {
     /// once per accepted connection with the peer's socket address and
     /// connection path.
     ///
-    /// When `None`, every inbound connection is treated as a public client.
+    /// When `None`, every inbound connection is treated as a public client and
+    /// one-hop remote FETCH remains disabled.
     /// Outbound connections the relay dials itself (`--announce`,
     /// [`RemoteManager`]) are always tagged internal and bypass this.
     pub connection_tagger: Option<Arc<dyn ConnectionTagger>>,
@@ -152,12 +153,17 @@ impl Relay {
             .collect::<Vec<_>>();
 
         // Create remote manager - uses coordinator for namespace lookups
-        let remotes = RemoteManager::new_with_session_config(
+        let mut remotes = RemoteManager::new_with_session_config(
             config.coordinator.clone(),
             remote_clients,
             config.session,
         )
         .with_cache_idle_timeout(cache_idle_timeout);
+        if config.connection_tagger.is_some() {
+            if let Some(node) = config.node.clone() {
+                remotes = remotes.with_local_url(node);
+            }
+        }
         let (upstream_namespaces, upstream_namespaces_runner) =
             UpstreamNamespaces::new(locals.clone(), remotes.clone(), config.coordinator.clone());
 

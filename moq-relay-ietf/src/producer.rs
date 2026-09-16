@@ -12,7 +12,7 @@ use moq_transport::{
     message::{RequestErrorCode, SubscribeOptions},
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
     session::{
-        FetchRequested, Publisher, SessionError, Subscribed, SubscribedNamespace,
+        Fetch, FetchRequested, Publisher, SessionError, Subscribed, SubscribedNamespace,
         TrackStatusRequested,
     },
 };
@@ -21,8 +21,8 @@ use tokio::sync::broadcast;
 use crate::{
     metrics::{GaugeGuard, TimingGuard},
     upstream_namespaces::UpstreamNamespaces,
-    Coordinator, Locals, NamespaceChange, RemoteManager, SessionContext, TrackChange,
-    UpstreamReady,
+    Coordinator, Locals, NamespaceChange, RemoteManager, SessionContext, SessionInterface,
+    TrackChange, UpstreamReady,
 };
 
 /// Producer of tracks to a remote Subscriber
@@ -50,6 +50,12 @@ enum UpstreamWait {
 
     /// The downstream subscriber went away before it was established.
     DownstreamLeft(ServeError),
+}
+
+enum RemoteFetchOutcome {
+    Closed,
+    Timeout,
+    Complete(Box<anyhow::Result<Option<Fetch>>>),
 }
 
 impl Producer {
@@ -175,18 +181,8 @@ impl Producer {
         let standalone = fetch
             .request
             .standalone_fetch
-            .as_ref()
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("standalone FETCH missing range"))?;
-        let Some(mut source) = self
-            .locals
-            .fetch_source(self.context.scope(), &standalone.track_namespace)
-        else {
-            fetch.reject(
-                RequestErrorCode::NotSupported,
-                "FETCH requires a local namespace publisher",
-            )?;
-            return Ok(());
-        };
         let params = match upstream_fetch_params(&fetch.request.params) {
             Ok(params) => params,
             Err(err) => {
@@ -197,15 +193,48 @@ impl Producer {
         if fetch.closed().now_or_never().is_some() {
             return Ok(());
         }
-        let upstream = match source.fetch(standalone.clone(), params) {
-            Ok(upstream) => upstream,
-            Err(err) => {
-                fetch.reject(
-                    RequestErrorCode::InternalError,
-                    "failed to open upstream FETCH",
-                )?;
-                return Err(err).context("failed to open upstream FETCH");
+        let upstream = if let Some(mut source) = self
+            .locals
+            .fetch_source(self.context.scope(), &standalone.track_namespace)
+        {
+            match source.fetch(standalone.clone(), params) {
+                Ok(upstream) => upstream,
+                Err(err) => {
+                    fetch.reject(
+                        RequestErrorCode::InternalError,
+                        "failed to open upstream FETCH",
+                    )?;
+                    return Err(err).context("failed to open upstream FETCH");
+                }
             }
+        } else {
+            if self.context.interface == SessionInterface::Internal {
+                fetch.reject(RequestErrorCode::DoesNotExist, "track not found")?;
+                return Ok(());
+            }
+
+            let remote = match self
+                .route_remote_fetch(&fetch, deadline, standalone.clone(), params)
+                .await
+            {
+                RemoteFetchOutcome::Closed => return Ok(()),
+                RemoteFetchOutcome::Timeout => {
+                    fetch.reject(RequestErrorCode::Timeout, "FETCH routing timed out")?;
+                    return Ok(());
+                }
+                RemoteFetchOutcome::Complete(result) => match *result {
+                    Ok(Some(remote)) => remote,
+                    Ok(None) => {
+                        fetch.reject(RequestErrorCode::DoesNotExist, "track not found")?;
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        fetch.reject(RequestErrorCode::InternalError, "failed to route FETCH")?;
+                        return Err(err).context("failed to route upstream FETCH");
+                    }
+                },
+            };
+            remote
         };
         fetch
             .proxy(
@@ -214,6 +243,23 @@ impl Producer {
             )
             .await?;
         Ok(())
+    }
+
+    async fn route_remote_fetch(
+        &self,
+        fetch: &FetchRequested,
+        deadline: tokio::time::Instant,
+        request: moq_transport::message::StandaloneFetch,
+        params: KeyValuePairs,
+    ) -> RemoteFetchOutcome {
+        let route = self.remotes.fetch(self.context.scope(), request, params);
+        tokio::pin!(route);
+        tokio::select! {
+            biased;
+            _ = fetch.closed() => RemoteFetchOutcome::Closed,
+            _ = tokio::time::sleep_until(deadline) => RemoteFetchOutcome::Timeout,
+            result = &mut route => RemoteFetchOutcome::Complete(Box::new(result)),
+        }
     }
 
     /// Serve a subscribe request.
@@ -735,9 +781,10 @@ fn upstream_fetch_params(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::io::Cursor;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -758,10 +805,33 @@ mod tests {
 
     use super::{upstream_fetch_params, Producer};
 
-    struct NoopCoordinator;
+    #[derive(Clone)]
+    struct TestCoordinator {
+        route: Option<(url::Url, std::net::SocketAddr, quic::Client)>,
+        lookups: Arc<AtomicUsize>,
+        scopes: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    impl TestCoordinator {
+        fn without_route() -> Self {
+            Self {
+                route: None,
+                lookups: Arc::new(AtomicUsize::new(0)),
+                scopes: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_route(url: url::Url, addr: std::net::SocketAddr, client: quic::Client) -> Self {
+            Self {
+                route: Some((url, addr, client)),
+                lookups: Arc::new(AtomicUsize::new(0)),
+                scopes: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
 
     #[async_trait]
-    impl Coordinator for NoopCoordinator {
+    impl Coordinator for TestCoordinator {
         async fn register_namespace(
             &self,
             _scope: Option<&str>,
@@ -781,10 +851,18 @@ mod tests {
 
         async fn lookup(
             &self,
-            _scope: Option<&str>,
-            _namespace: &TrackNamespace,
+            scope: Option<&str>,
+            namespace: &TrackNamespace,
         ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
-            Err(CoordinatorError::NamespaceNotFound)
+            self.lookups.fetch_add(1, Ordering::Relaxed);
+            self.scopes.lock().unwrap().push(scope.map(str::to_string));
+            let Some((url, addr, client)) = &self.route else {
+                return Err(CoordinatorError::NamespaceNotFound);
+            };
+            Ok((
+                NamespaceOrigin::new(namespace.clone(), url.clone(), Some(*addr)),
+                Some(client.clone()),
+            ))
         }
     }
 
@@ -857,7 +935,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn manual_peer_inner() -> ManualPeer {
+    fn test_endpoint() -> (quic::Client, quic::Server, url::Url, std::net::SocketAddr) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let certificate = certified.cert.der().clone();
@@ -888,10 +966,15 @@ mod tests {
         )
         .unwrap();
         let quic_client = endpoint.client;
-        let mut server = endpoint.server.unwrap();
+        let server = endpoint.server.unwrap();
         let port = server.local_addr().unwrap().port();
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let url = url::Url::parse(&format!("moqt://localhost:{port}/")).unwrap();
+        (quic_client, server, url, addr)
+    }
+
+    async fn manual_peer_inner() -> ManualPeer {
+        let (quic_client, mut server, url, addr) = test_endpoint();
         let (client_connection, server_connection) =
             tokio::join!(quic_client.connect(&url, Some(addr)), server.accept());
         let (client_transport, _, client_kind) = client_connection.unwrap();
@@ -926,6 +1009,14 @@ mod tests {
     }
 
     fn fetch_request(id: u64, namespace: &TrackNamespace) -> Message {
+        fetch_request_with_params(id, namespace, KeyValuePairs::default())
+    }
+
+    fn fetch_request_with_params(
+        id: u64,
+        namespace: &TrackNamespace,
+        params: KeyValuePairs,
+    ) -> Message {
         message::Fetch {
             id,
             fetch_type: FetchType::Standalone,
@@ -936,16 +1027,57 @@ mod tests {
                 end_location: Location::new(1, 0),
             }),
             joining_fetch: None,
-            params: KeyValuePairs::default(),
+            params,
         }
         .into()
+    }
+
+    async fn send_fetch_ok(
+        transport: &web_transport::Session,
+        control: &mut web_transport::SendStream,
+        request_id: u64,
+        body: &[u8],
+    ) {
+        let mut stream = transport.open_uni().await.unwrap();
+        write(
+            &mut stream,
+            &FetchHeader {
+                header_type: StreamHeaderType::Fetch,
+                request_id,
+            },
+        )
+        .await;
+        write_bytes(&mut stream, body).await;
+        stream.finish().unwrap();
+        write(
+            control,
+            &Message::FetchOk(message::FetchOk {
+                id: request_id,
+                end_of_track: true,
+                end_location: Location::new(1, 0),
+                params: KeyValuePairs::default(),
+                track_extensions: Default::default(),
+            }),
+        )
+        .await;
+    }
+
+    async fn receive_fetch_stream(transport: &web_transport::Session) -> (u64, Vec<u8>) {
+        let stream = transport.accept_uni().await.unwrap();
+        let mut stream = WireReader::new(stream);
+        let header: StreamHeader = stream.decode().await;
+        let id = header.fetch_header.unwrap().request_id;
+        let body = stream.read_to_end().await;
+        (id, body)
     }
 
     #[tokio::test]
     async fn local_namespace_fetch_passthrough_is_fresh_and_bidirectional() {
         let mut downstream = manual_peer().await;
         let mut upstream = manual_peer().await;
-        let coordinator: Arc<dyn Coordinator> = Arc::new(NoopCoordinator);
+        let test_coordinator = TestCoordinator::without_route();
+        let lookups = test_coordinator.lookups.clone();
+        let coordinator: Arc<dyn Coordinator> = Arc::new(test_coordinator);
         let locals = Locals::new();
         let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
         let producer = Producer::new(
@@ -1064,6 +1196,7 @@ mod tests {
                 upstream.control_recv.decode::<Message>().await,
                 Message::FetchCancel(message::FetchCancel { id }) if id == request.id
             ));
+            assert_eq!(lookups.load(Ordering::Relaxed), 0);
         };
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1073,6 +1206,237 @@ mod tests {
                 result = consumer.run() => panic!("consumer ended: {result:?}"),
                 result = downstream.server_session.run() => panic!("downstream server ended: {result:?}"),
                 result = upstream.server_session.run() => panic!("upstream server ended: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_relay_fetch_is_one_hop_fresh_and_cache_free() {
+        let mut downstream = manual_peer().await;
+        let mut publisher = manual_peer().await;
+        let (route_client, mut origin_server, origin_url, origin_addr) = test_endpoint();
+        let edge_coordinator =
+            TestCoordinator::with_route(origin_url.clone(), origin_addr, route_client);
+        let edge_lookups = edge_coordinator.lookups.clone();
+        let edge_scopes = edge_coordinator.scopes.clone();
+        let edge_coordinator: Arc<dyn Coordinator> = Arc::new(edge_coordinator);
+        let origin_coordinator = TestCoordinator::without_route();
+        let origin_lookups = origin_coordinator.lookups.clone();
+        let origin_coordinator: Arc<dyn Coordinator> = Arc::new(origin_coordinator);
+        let edge_locals = Locals::new();
+        let origin_locals = Locals::new();
+        let edge_remotes = RemoteManager::new(edge_coordinator.clone(), Vec::new())
+            .with_local_url(url::Url::parse("moqt://edge.example/internal").unwrap());
+        let origin_remotes = RemoteManager::new(origin_coordinator.clone(), Vec::new())
+            .with_local_url(origin_url.clone());
+        let edge = Producer::new(
+            downstream.server_publisher,
+            edge_locals,
+            edge_remotes,
+            edge_coordinator,
+            SessionContext::public(Some("scope-a".to_string())),
+        );
+        let origin_consumer = Consumer::new(
+            publisher.server_subscriber,
+            origin_locals.clone(),
+            origin_coordinator.clone(),
+            origin_remotes.clone(),
+            None,
+            SessionContext::public(Some("scope-a".to_string())),
+        );
+        let origin_locals_for_connection = origin_locals.clone();
+        let origin_remotes_for_connection = origin_remotes.clone();
+        let origin_coordinator_for_connection = origin_coordinator.clone();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_for_connection = accepts.clone();
+        let origin_connection = async move {
+            let (transport, info) = origin_server.accept().await.unwrap();
+            accepts_for_connection.fetch_add(1, Ordering::Relaxed);
+            let (session, relay_publisher, _) = Session::accept(transport, None, info.transport)
+                .await
+                .unwrap();
+            let origin = Producer::new(
+                relay_publisher.unwrap(),
+                origin_locals_for_connection,
+                origin_remotes_for_connection,
+                origin_coordinator_for_connection,
+                SessionContext::internal(Some("scope-a".to_string()), None),
+            );
+            tokio::select! {
+                result = session.run() => panic!("origin relay session ended: {result:?}"),
+                result = origin.run() => panic!("origin producer ended: {result:?}"),
+            }
+        };
+        let namespace = TrackNamespace::from_utf8_path("test/fetch");
+        let missing = TrackNamespace::from_utf8_path("test/missing");
+
+        let scenario = async {
+            write(
+                &mut publisher.control_send,
+                &Message::PublishNamespace(message::PublishNamespace {
+                    id: 0,
+                    track_namespace: namespace.clone(),
+                    params: KeyValuePairs::default(),
+                }),
+            )
+            .await;
+            assert!(matches!(
+                publisher.control_recv.decode::<Message>().await,
+                Message::RequestOk(message::RequestOk { id: 0, .. })
+            ));
+
+            let mut params = KeyValuePairs::default();
+            params.set_bytesvalue(parameter_type::AUTHORIZATION_TOKEN, b"private".to_vec());
+            params.set_subscriber_priority(7);
+            params.set_group_order(GroupOrder::Descending);
+            params.set_intvalue(0x40, 9);
+            write(
+                &mut downstream.control_send,
+                &fetch_request_with_params(0, &namespace, params.clone()),
+            )
+            .await;
+            write(
+                &mut downstream.control_send,
+                &fetch_request_with_params(2, &namespace, params),
+            )
+            .await;
+            let Message::Fetch(first) = publisher.control_recv.decode::<Message>().await else {
+                panic!("expected first publisher FETCH");
+            };
+            let Message::Fetch(second) = publisher.control_recv.decode::<Message>().await else {
+                panic!("expected second publisher FETCH");
+            };
+            assert_ne!(first.id, second.id);
+            for request in [&first, &second] {
+                assert_eq!(
+                    request.params.group_order().unwrap(),
+                    Some(GroupOrder::Descending)
+                );
+                assert_eq!(request.params.subscriber_priority().unwrap(), None);
+                assert!(request
+                    .params
+                    .get(parameter_type::AUTHORIZATION_TOKEN)
+                    .is_none());
+                assert!(request.params.get(0x40).is_none());
+            }
+            send_fetch_ok(
+                &publisher.transport,
+                &mut publisher.control_send,
+                second.id,
+                b"second",
+            )
+            .await;
+            send_fetch_ok(
+                &publisher.transport,
+                &mut publisher.control_send,
+                first.id,
+                b"first",
+            )
+            .await;
+            let responses = [
+                receive_fetch_stream(&downstream.transport).await,
+                receive_fetch_stream(&downstream.transport).await,
+            ];
+            let mut response_ids = HashSet::new();
+            for _ in 0..2 {
+                let Message::FetchOk(ok) = downstream.control_recv.decode::<Message>().await else {
+                    panic!("expected FETCH_OK");
+                };
+                response_ids.insert(ok.id);
+            }
+            assert_eq!(response_ids, HashSet::from([0, 2]));
+            let bodies: HashMap<_, _> = responses.into_iter().collect();
+            assert_eq!(bodies.len(), 2);
+            assert!(bodies.contains_key(&0));
+            assert!(bodies.contains_key(&2));
+            assert_eq!(
+                bodies.into_values().collect::<HashSet<_>>(),
+                HashSet::from([b"first".to_vec(), b"second".to_vec()])
+            );
+
+            write(&mut downstream.control_send, &fetch_request(4, &namespace)).await;
+            let Message::Fetch(third) = publisher.control_recv.decode::<Message>().await else {
+                panic!("expected sequential publisher FETCH");
+            };
+            assert_ne!(third.id, first.id);
+            assert_ne!(third.id, second.id);
+            send_fetch_ok(
+                &publisher.transport,
+                &mut publisher.control_send,
+                third.id,
+                b"third",
+            )
+            .await;
+            let response = receive_fetch_stream(&downstream.transport).await;
+            let Message::FetchOk(ok) = downstream.control_recv.decode::<Message>().await else {
+                panic!("expected sequential FETCH_OK");
+            };
+            assert_eq!(ok.id, response.0);
+            assert_eq!(response, (4, b"third".to_vec()));
+
+            write(&mut downstream.control_send, &fetch_request(6, &namespace)).await;
+            let Message::Fetch(failed) = publisher.control_recv.decode::<Message>().await else {
+                panic!("expected failed publisher FETCH");
+            };
+            write(
+                &mut publisher.control_send,
+                &Message::RequestError(message::RequestError::new(
+                    failed.id,
+                    RequestErrorCode::DoesNotExist,
+                    42,
+                    "origin miss",
+                )),
+            )
+            .await;
+            let Message::RequestError(error) = downstream.control_recv.decode::<Message>().await
+            else {
+                panic!("expected downstream REQUEST_ERROR");
+            };
+            assert_eq!(error.id, 6);
+            assert_eq!(error.retry_interval, 42);
+            assert_eq!(error.reason.0, "origin miss");
+
+            write(&mut downstream.control_send, &fetch_request(8, &namespace)).await;
+            let Message::Fetch(cancelled) = publisher.control_recv.decode::<Message>().await else {
+                panic!("expected cancellable publisher FETCH");
+            };
+            write(
+                &mut downstream.control_send,
+                &Message::FetchCancel(message::FetchCancel { id: 8 }),
+            )
+            .await;
+            assert!(matches!(
+                publisher.control_recv.decode::<Message>().await,
+                Message::FetchCancel(message::FetchCancel { id }) if id == cancelled.id
+            ));
+
+            write(&mut downstream.control_send, &fetch_request(10, &missing)).await;
+            let Message::RequestError(error) = downstream.control_recv.decode::<Message>().await
+            else {
+                panic!("expected missing-track REQUEST_ERROR");
+            };
+            assert_eq!(error.id, 10);
+            assert_eq!(error.error_code, RequestErrorCode::DoesNotExist as u64);
+            assert_eq!(origin_lookups.load(Ordering::Relaxed), 0);
+            assert_eq!(edge_lookups.load(Ordering::Relaxed), 6);
+            assert_eq!(accepts.load(Ordering::Relaxed), 1);
+            assert!(edge_scopes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|scope| scope.as_deref() == Some("scope-a")));
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                _ = scenario => {},
+                _ = origin_connection => {},
+                result = edge.run() => panic!("edge producer ended: {result:?}"),
+                result = origin_consumer.run() => panic!("origin consumer ended: {result:?}"),
+                result = downstream.server_session.run() => panic!("downstream relay session ended: {result:?}"),
+                result = publisher.server_session.run() => panic!("publisher relay session ended: {result:?}"),
             }
         })
         .await

@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use moq_native_ietf::quic;
 use moq_transport::coding::{KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix};
-use moq_transport::message::SubscribeOptions;
-use moq_transport::serve::{Track, TrackReader, TracksReader};
-use moq_transport::session::{Publisher, SessionConfig, SubscribeNamespace};
+use moq_transport::message::{StandaloneFetch, SubscribeOptions};
+use moq_transport::serve::{ServeError, Track, TrackReader, TracksReader};
+use moq_transport::session::{Fetch, Publisher, SessionConfig, SubscribeNamespace};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -64,6 +64,9 @@ pub struct RemoteManager {
     /// How long an unwatched cross-relay cache entry is retained before its
     /// upstream subscription is released. Zero disables eviction.
     cache_idle_timeout: Duration,
+
+    /// This relay's public identity. Remote FETCH is disabled when absent.
+    local_url: Option<Url>,
 }
 
 #[cfg(test)]
@@ -71,6 +74,10 @@ mod tests {
     use super::*;
 
     struct NoopCoordinator;
+
+    struct SelfCoordinator {
+        url: Url,
+    }
 
     #[async_trait::async_trait]
     impl Coordinator for NoopCoordinator {
@@ -97,6 +104,37 @@ mod tests {
             _namespace: &TrackNamespace,
         ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
             Err(crate::CoordinatorError::NamespaceNotFound)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Coordinator for SelfCoordinator {
+        async fn register_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+            _context: &crate::CoordinatorContext,
+        ) -> crate::CoordinatorResult<crate::NamespaceRegistration> {
+            Ok(crate::NamespaceRegistration::new(()))
+        }
+
+        async fn unregister_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+        ) -> crate::CoordinatorResult<()> {
+            Ok(())
+        }
+
+        async fn lookup(
+            &self,
+            _scope: Option<&str>,
+            namespace: &TrackNamespace,
+        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
+            Ok((
+                crate::NamespaceOrigin::new(namespace.clone(), self.url.clone(), None),
+                None,
+            ))
         }
     }
 
@@ -172,6 +210,55 @@ mod tests {
             err.to_string().contains("no QUIC clients configured"),
             "unexpected error: {err}"
         );
+    }
+
+    fn fetch_request() -> moq_transport::message::StandaloneFetch {
+        moq_transport::message::StandaloneFetch {
+            track_namespace: TrackNamespace::from_utf8_path("test/fetch"),
+            track_name: "video".into(),
+            start_location: moq_transport::coding::Location::new(0, 0),
+            end_location: moq_transport::coding::Location::new(1, 0),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_requires_local_identity() {
+        let manager = RemoteManager::new(Arc::new(NoopCoordinator), Vec::new());
+
+        assert!(manager
+            .fetch(None, fetch_request(), KeyValuePairs::default())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_returns_none_when_coordinator_has_no_origin() {
+        let manager = RemoteManager::new(Arc::new(NoopCoordinator), Vec::new())
+            .with_local_url(Url::parse("moqt://relay.example/").unwrap());
+
+        assert!(manager
+            .fetch(None, fetch_request(), KeyValuePairs::default())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_rejects_self_origin_before_connecting() {
+        let local = Url::parse("https://relay.example/internal").unwrap();
+        let manager = RemoteManager::new(
+            Arc::new(SelfCoordinator {
+                url: Url::parse("moqt://relay.example/other-scope").unwrap(),
+            }),
+            Vec::new(),
+        )
+        .with_local_url(local);
+
+        assert!(manager
+            .fetch(None, fetch_request(), KeyValuePairs::default())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     fn cached_track() -> (TrackSlot, TrackInterest) {
@@ -282,7 +369,14 @@ impl RemoteManager {
             session_config,
             remotes: Arc::new(Mutex::new(HashMap::new())),
             cache_idle_timeout: DEFAULT_CACHE_IDLE_TIMEOUT,
+            local_url: None,
         }
+    }
+
+    /// Enable one-hop remote FETCH and reject coordinator self-routes.
+    pub fn with_local_url(mut self, local_url: Url) -> Self {
+        self.local_url = Some(local_url);
+        self
     }
 
     /// Override how long an unwatched cross-relay cache entry is retained before
@@ -350,6 +444,35 @@ impl RemoteManager {
         }
         .instrument(span)
         .await
+    }
+
+    /// Start a fresh FETCH on the relay serving this namespace.
+    pub async fn fetch(
+        &self,
+        scope: Option<&str>,
+        request: StandaloneFetch,
+        params: KeyValuePairs,
+    ) -> anyhow::Result<Option<Fetch>> {
+        let local_url = self
+            .local_url
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("remote FETCH is not configured"))?;
+        let (origin, client) = match self
+            .coordinator
+            .lookup(scope, &request.track_namespace)
+            .await
+        {
+            Ok(result) => result,
+            Err(CoordinatorError::NamespaceNotFound) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        if same_endpoint(&origin.url(), local_url) {
+            return Ok(None);
+        }
+
+        let cache_key = (origin.url(), origin.addr());
+        let remote = self.get_or_connect(cache_key, client.as_ref()).await?;
+        Ok(Some(remote.fetch(request, params)?))
     }
 
     /// Forward a `SUBSCRIBE_NAMESPACE` to a specific relay peer.
@@ -546,6 +669,15 @@ impl RemoteManager {
             }
         }
     }
+}
+
+fn same_endpoint(left: &Url, right: &Url) -> bool {
+    fn port(url: &Url) -> Option<u16> {
+        url.port_or_known_default()
+            .or_else(|| (url.scheme() == "moqt").then_some(443))
+    }
+
+    left.host_str() == right.host_str() && port(left) == port(right)
 }
 
 async fn remove_empty_remote_slot(
@@ -949,6 +1081,17 @@ impl Remote {
 
             return Ok(Some((reader, guard)));
         }
+    }
+
+    fn fetch(&self, request: StandaloneFetch, params: KeyValuePairs) -> Result<Fetch, ServeError> {
+        if !self.is_connected() {
+            return Err(ServeError::internal_ctx(format!(
+                "remote connection to {} is closed",
+                self.url
+            )));
+        }
+        let mut subscriber = self.subscriber.clone();
+        subscriber.fetch(request, params)
     }
 
     /// Forward a `SUBSCRIBE_NAMESPACE` to this peer (Subscriber role).
