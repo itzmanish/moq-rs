@@ -174,26 +174,6 @@ mod tests {
         );
     }
 
-    fn fetch_request() -> moq_transport::message::StandaloneFetch {
-        moq_transport::message::StandaloneFetch {
-            track_namespace: TrackNamespace::from_utf8_path("test/fetch"),
-            track_name: "video".into(),
-            start_location: moq_transport::coding::Location::new(0, 0),
-            end_location: moq_transport::coding::Location::new(1, 0),
-        }
-    }
-
-    #[tokio::test]
-    async fn remote_fetch_returns_none_when_coordinator_has_no_origin() {
-        let manager = RemoteManager::new(Arc::new(NoopCoordinator), Vec::new());
-
-        assert!(manager
-            .fetch(None, fetch_request(), KeyValuePairs::default())
-            .await
-            .unwrap()
-            .is_none());
-    }
-
     fn cached_track() -> (TrackSlot, TrackInterest) {
         let (_writer, reader) = moq_transport::serve::Track::new(
             TrackNamespace::from_utf8_path("example.com"),
@@ -390,7 +370,7 @@ impl RemoteManager {
         };
         let cache_key = (origin.url(), origin.addr());
         let remote = self.get_or_connect(cache_key, client.as_ref()).await?;
-        Ok(Some(remote.fetch(request, params).await?))
+        Ok(Some(remote.fetch(request, params)?))
     }
 
     /// Forward a `SUBSCRIBE_NAMESPACE` to a specific relay peer.
@@ -992,18 +972,15 @@ impl Remote {
         }
     }
 
-    async fn fetch(
-        &self,
-        request: StandaloneFetch,
-        params: KeyValuePairs,
-    ) -> Result<Fetch, moq_transport::session::SessionError> {
+    fn fetch(&self, request: StandaloneFetch, params: KeyValuePairs) -> Result<Fetch, ServeError> {
         if !self.is_connected() {
-            return Err(moq_transport::session::SessionError::Serve(
-                ServeError::internal_ctx(format!("remote connection to {} is closed", self.url)),
-            ));
+            return Err(ServeError::internal_ctx(format!(
+                "remote connection to {} is closed",
+                self.url
+            )));
         }
         let mut subscriber = self.subscriber.clone();
-        subscriber.fetch_wait(request, params).await
+        subscriber.fetch(request, params)
     }
 
     /// Forward a `SUBSCRIBE_NAMESPACE` to this peer (Subscriber role).

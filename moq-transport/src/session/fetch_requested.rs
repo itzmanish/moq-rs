@@ -41,7 +41,6 @@ pub struct FetchRequested {
     active: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
     state: State<FetchRequestedState>,
     id: u64,
-    received_at: tokio::time::Instant,
     pub request: message::Fetch,
 }
 
@@ -67,7 +66,6 @@ impl FetchRequested {
                 active,
                 state: send,
                 id,
-                received_at: tokio::time::Instant::now(),
                 request,
             },
             FetchRequestedRecv { state: recv },
@@ -96,10 +94,6 @@ impl FetchRequested {
         self.claim_response()?;
         self.send_error(code, reason);
         Ok(())
-    }
-
-    pub fn deadline(&self, timeout: Duration) -> tokio::time::Instant {
-        self.received_at + timeout
     }
 
     pub async fn proxy(self, mut upstream: Fetch, timeout: Duration) -> Result<(), SessionError> {
@@ -241,11 +235,6 @@ pub(super) fn inclusive_end(end: Location) -> Location {
     } else {
         Location::new(end.group_id, end.object_id - 1)
     }
-}
-
-pub(super) fn fetch_end_in_range(start: Location, end: Location, response: Location) -> bool {
-    (response == start || inclusive_end(response) >= start)
-        && inclusive_end(response) <= inclusive_end(end)
 }
 
 fn proxied_response(mut response: message::FetchOk, request_id: u64) -> message::FetchOk {
@@ -430,18 +419,6 @@ mod tests {
         assert_eq!(error.id, 11);
         assert_eq!(error.error_code, RequestErrorCode::InternalError as u64);
         assert!(active.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn deadline_starts_when_request_is_received() {
-        let before = tokio::time::Instant::now();
-        let handles = handles(13);
-        let after = tokio::time::Instant::now();
-
-        let deadline = handles.request.deadline(Duration::from_secs(30));
-
-        assert!(deadline >= before + Duration::from_secs(30));
-        assert!(deadline <= after + Duration::from_secs(30));
     }
 
     #[test]

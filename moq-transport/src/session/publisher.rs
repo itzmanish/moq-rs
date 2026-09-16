@@ -688,7 +688,6 @@ impl Publisher {
             self.fetches.clone(),
             msg,
         );
-        // Sequenced request IDs are validated by Session::run_recv before dispatch.
         self.fetches
             .lock()
             .map_err(|_| SessionError::Internal)?

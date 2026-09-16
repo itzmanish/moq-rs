@@ -171,7 +171,7 @@ impl Producer {
     }
 
     async fn serve_fetch(self, fetch: FetchRequested) -> Result<(), anyhow::Error> {
-        let deadline = fetch.deadline(Duration::from_secs(30));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let standalone = fetch
             .request
             .standalone_fetch
@@ -192,7 +192,7 @@ impl Producer {
                 .locals
                 .fetch_source(self.context.scope(), &standalone.track_namespace)
             {
-                Ok(Some(source.fetch_wait(standalone, params).await?))
+                Ok(Some(source.fetch(standalone, params)?))
             } else {
                 self.remotes
                     .fetch(self.context.scope(), standalone, params)
@@ -759,7 +759,7 @@ mod tests {
         data::{FetchHeader, StreamHeader, StreamHeaderType},
         message::{self, parameter_type, FetchType, GroupOrder, Message, RequestErrorCode},
         serve::ServeError,
-        session::{Session, SessionConfig, SessionError},
+        session::{Session, SessionError},
         setup,
     };
 
@@ -768,7 +768,7 @@ mod tests {
         NamespaceOrigin, NamespaceRegistration, RemoteManager, SessionContext,
     };
 
-    use super::{upstream_fetch_params, Producer};
+    use super::Producer;
 
     #[derive(Clone)]
     struct TestCoordinator {
@@ -1082,34 +1082,18 @@ mod tests {
             let Message::Fetch(first) = upstream.control_recv.decode::<Message>().await else {
                 panic!("expected upstream FETCH");
             };
-            let mut stream = upstream.transport.open_uni().await.unwrap();
-            write(
-                &mut stream,
-                &FetchHeader {
-                    header_type: StreamHeaderType::Fetch,
-                    request_id: first.id,
-                },
-            )
-            .await;
-            write_bytes(&mut stream, body).await;
-            stream.finish().unwrap();
-            write(
+            send_fetch_ok(
+                &upstream.transport,
                 &mut upstream.control_send,
-                &Message::FetchOk(message::FetchOk {
-                    id: first.id,
-                    end_of_track: true,
-                    end_location: Location::new(1, 0),
-                    params: KeyValuePairs::default(),
-                    track_extensions: Default::default(),
-                }),
+                first.id,
+                body,
             )
             .await;
 
-            let stream = downstream.transport.accept_uni().await.unwrap();
-            let mut stream = WireReader::new(stream);
-            let header: StreamHeader = stream.decode().await;
-            assert_eq!(header.fetch_header.unwrap().request_id, 0);
-            assert_eq!(stream.read_to_end().await, body);
+            assert_eq!(
+                receive_fetch_stream(&downstream.transport).await,
+                (0, body.to_vec())
+            );
             assert!(matches!(
                 downstream.control_recv.decode::<Message>().await,
                 Message::FetchOk(message::FetchOk {
@@ -1212,19 +1196,11 @@ mod tests {
         let origin_locals_for_connection = origin_locals.clone();
         let origin_remotes_for_connection = origin_remotes.clone();
         let origin_coordinator_for_connection = origin_coordinator.clone();
-        let accepts = Arc::new(AtomicUsize::new(0));
-        let accepts_for_connection = accepts.clone();
         let origin_connection = async move {
             let (transport, info) = origin_server.accept().await.unwrap();
-            accepts_for_connection.fetch_add(1, Ordering::Relaxed);
-            let (session, relay_publisher, _) = Session::accept_with_config(
-                transport,
-                None,
-                info.transport,
-                SessionConfig { max_request_id: 4 },
-            )
-            .await
-            .unwrap();
+            let (session, relay_publisher, _) = Session::accept(transport, None, info.transport)
+                .await
+                .unwrap();
             let origin = Producer::new(
                 relay_publisher.unwrap(),
                 origin_locals_for_connection,
@@ -1314,9 +1290,6 @@ mod tests {
             }
             assert_eq!(response_ids, HashSet::from([0, 2]));
             let bodies: HashMap<_, _> = responses.into_iter().collect();
-            assert_eq!(bodies.len(), 2);
-            assert!(bodies.contains_key(&0));
-            assert!(bodies.contains_key(&2));
             assert_eq!(bodies.get(&0).map(Vec::as_slice), Some(b"first".as_slice()));
             assert_eq!(
                 bodies.get(&2).map(Vec::as_slice),
@@ -1388,7 +1361,6 @@ mod tests {
             assert_eq!(error.error_code, RequestErrorCode::DoesNotExist as u64);
             assert_eq!(origin_lookups.load(Ordering::Relaxed), 1);
             assert_eq!(edge_lookups.load(Ordering::Relaxed), 6);
-            assert_eq!(accepts.load(Ordering::Relaxed), 1);
             assert!(edge_scopes
                 .lock()
                 .unwrap()
@@ -1408,25 +1380,6 @@ mod tests {
         })
         .await
         .unwrap();
-    }
-
-    #[test]
-    fn fetch_params_keep_delivery_policy_without_forwarding_credentials() {
-        let mut params = KeyValuePairs::default();
-        params.set_bytesvalue(parameter_type::AUTHORIZATION_TOKEN, b"private".to_vec());
-        params.set_subscriber_priority(7);
-        params.set_group_order(GroupOrder::Descending);
-        params.set_intvalue(0x40, 9);
-
-        let upstream = upstream_fetch_params(&params).unwrap();
-
-        assert_eq!(upstream.subscriber_priority().unwrap(), None);
-        assert_eq!(
-            upstream.group_order().unwrap(),
-            Some(GroupOrder::Descending)
-        );
-        assert!(upstream.get(parameter_type::AUTHORIZATION_TOKEN).is_none());
-        assert!(upstream.get(0x40).is_none());
     }
 
     #[test]

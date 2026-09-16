@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::{
-    collections::{hash_map, HashMap, HashSet, VecDeque},
+    collections::{hash_map, HashMap, HashSet},
     io,
     sync::{Arc, Mutex},
     time::Duration,
@@ -22,48 +22,14 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    fetch_requested::{fetch_end_in_range, inclusive_end},
-    Fetch, FetchRecv, OpenSubscribeNamespace, PendingRequest, PendingRequests, PendingResponse,
-    PublishReceived, PublishReceivedRecv, PublishedNamespace, PublishedNamespaceRecv, Reader,
-    RequestId, RequestIdAllocation, Session, SessionConfig, SessionError, SessionId, Subscribe,
-    SubscribeNamespace, SubscribeRecv,
+    fetch_requested::inclusive_end, Fetch, FetchRecv, OpenSubscribeNamespace, PendingRequest,
+    PendingRequests, PendingResponse, PublishReceived, PublishReceivedRecv, PublishedNamespace,
+    PublishedNamespaceRecv, Reader, RequestId, RequestIdAllocation, Session, SessionConfig,
+    SessionError, SessionId, Subscribe, SubscribeNamespace, SubscribeRecv,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
 const DEFAULT_ALIAS_WAIT_TIME_MS: u64 = 1000;
-
-const MAX_TERMINAL_FETCHES: usize = 1024;
-
-#[derive(Default)]
-struct FetchRegistry {
-    active: HashMap<u64, FetchRecv>,
-    terminal: VecDeque<(u64, bool)>,
-}
-
-impl FetchRegistry {
-    fn insert(&mut self, id: u64, fetch: FetchRecv) {
-        self.active.insert(id, fetch);
-    }
-
-    fn remove(&mut self, id: u64) -> Option<FetchRecv> {
-        let fetch = self.active.remove(&id)?;
-        self.terminal.push_back((id, fetch.stream_received()));
-        if self.terminal.len() > MAX_TERMINAL_FETCHES {
-            self.terminal.pop_front();
-        }
-        Some(fetch)
-    }
-
-    fn receive_terminal_stream(&mut self, id: u64) -> Option<bool> {
-        let terminal = self
-            .terminal
-            .iter_mut()
-            .find(|(terminal_id, _)| *terminal_id == id)?;
-        let stream_received = terminal.1;
-        terminal.1 = true;
-        Some(stream_received)
-    }
-}
 
 // TODO remove Clone.
 #[derive(Clone)]
@@ -81,7 +47,7 @@ pub struct Subscriber {
     track_statuses: Arc<Mutex<HashSet<u64>>>,
 
     /// Active outbound FETCH requests, keyed by request ID.
-    fetches: Arc<Mutex<FetchRegistry>>,
+    fetches: Arc<Mutex<HashMap<u64, FetchRecv>>>,
 
     /// Unified map of Track Alias → owning subscription (draft-16 §10.1).
     ///
@@ -657,36 +623,15 @@ impl Subscriber {
         standalone: message::StandaloneFetch,
         params: KeyValuePairs,
     ) -> Result<Fetch, ServeError> {
-        self.try_fetch(standalone, params).map_err(Into::into)
-    }
-
-    pub async fn fetch_wait(
-        &mut self,
-        standalone: message::StandaloneFetch,
-        params: KeyValuePairs,
-    ) -> Result<Fetch, SessionError> {
-        loop {
-            match self.try_fetch(standalone.clone(), params.clone()) {
-                Err(SessionError::TooManyRequests) => {
-                    self.request_id.wait_for_send_credit().await?
-                }
-                result => return result,
-            }
-        }
-    }
-
-    fn try_fetch(
-        &mut self,
-        standalone: message::StandaloneFetch,
-        params: KeyValuePairs,
-    ) -> Result<Fetch, SessionError> {
         if standalone.start_location != standalone.end_location
             && standalone.start_location > inclusive_end(standalone.end_location)
         {
-            return Err(SessionError::Serve(ServeError::Size));
+            return Err(ServeError::Size);
         }
-        let id = self.get_next_request_id()?;
-        self.pending_requests.insert(id, PendingRequest::Fetch)?;
+        let id = self.get_next_request_id().map_err(ServeError::from)?;
+        self.pending_requests
+            .insert(id, PendingRequest::Fetch)
+            .map_err(ServeError::from)?;
         let request = message::Fetch {
             id,
             fetch_type: message::FetchType::Standalone,
@@ -694,16 +639,16 @@ impl Subscriber {
             joining_fetch: None,
             params,
         };
+        let mut fetches = match self.fetches.lock() {
+            Ok(fetches) => fetches,
+            Err(_) => {
+                let _ = self.pending_requests.remove(id);
+                return Err(SessionError::Internal.into());
+            }
+        };
         let (fetch, recv) = Fetch::new(self.clone(), request.clone());
-        if self
-            .fetches
-            .lock()
-            .map(|mut fetches| fetches.insert(id, recv))
-            .is_err()
-        {
-            let _ = self.pending_requests.remove(id);
-            return Err(SessionError::Internal);
-        }
+        fetches.insert(id, recv);
+        drop(fetches);
         self.send_message(request);
         Ok(fetch)
     }
@@ -751,12 +696,13 @@ impl Subscriber {
             .fetches
             .lock()
             .map_err(|_| SessionError::Internal)?
-            .active
             .get(&msg.id)
-            .is_some_and(|fetch| !fetch_end_in_range(fetch.start, fetch.end, msg.end_location))
+            .is_some_and(|fetch| {
+                msg.end_location != fetch.start && inclusive_end(msg.end_location) < fetch.start
+            })
         {
             return Err(SessionError::ProtocolViolation(
-                "FETCH_OK end location is outside the requested range".to_string(),
+                "FETCH_OK end location precedes the requested start".to_string(),
             ));
         }
         let request = self
@@ -767,7 +713,6 @@ impl Subscriber {
                 .fetches
                 .lock()
                 .map_err(|_| SessionError::Internal)?
-                .active
                 .contains_key(&msg.id)
             {
                 return Err(SessionError::ProtocolViolation(
@@ -780,7 +725,6 @@ impl Subscriber {
             .fetches
             .lock()
             .map_err(|_| SessionError::Internal)?
-            .active
             .get_mut(&msg.id)
         {
             fetch.recv_ok(msg)?;
@@ -789,27 +733,10 @@ impl Subscriber {
     }
 
     pub(super) fn remove_fetch(&mut self, id: u64) {
-        let _ = self.pending_requests.remove(id);
         if let Ok(mut fetches) = self.fetches.lock() {
-            fetches.remove(id);
+            fetches.remove(&id);
         }
-    }
-
-    pub(super) fn close_fetches(&self, err: ServeError) {
-        let active = match self.fetches.lock() {
-            Ok(mut fetches) => {
-                fetches.terminal.clear();
-                fetches
-                    .active
-                    .drain()
-                    .map(|(_, fetch)| fetch)
-                    .collect::<Vec<_>>()
-            }
-            Err(_) => return,
-        };
-        for mut fetch in active {
-            let _ = fetch.recv_timeout(err.clone());
-        }
+        let _ = self.pending_requests.remove(id);
     }
 
     /// Handle reception of an inbound PUBLISH_NAMESPACE from the publisher.
@@ -1141,7 +1068,7 @@ impl Subscriber {
             .fetches
             .lock()
             .map_err(|_| SessionError::Internal)?
-            .remove(msg.id);
+            .remove(&msg.id);
         if let Some(mut fetch) = fetch {
             fetch.recv_error(msg)?;
             return Ok(());
@@ -1207,7 +1134,7 @@ impl Subscriber {
                     .fetches
                     .lock()
                     .map_err(|_| SessionError::Internal)?
-                    .remove(id);
+                    .remove(&id);
                 if let Some(mut fetch) = fetch {
                     self.send_message(message::FetchCancel { id });
                     fetch.recv_timeout(ServeError::internal_ctx("FETCH response timed out"))?;
@@ -1313,35 +1240,14 @@ impl Subscriber {
         if stream_header.header_type.is_fetch() {
             let fetch = stream_header.fetch_header.ok_or(SessionError::Internal)?;
             let mut fetches = self.fetches.lock().map_err(|_| SessionError::Internal)?;
-            if let Some(recv) = fetches.active.get_mut(&fetch.request_id) {
-                recv.recv_stream(reader).map_err(|err| {
-                    if err == ServeError::Duplicate {
-                        SessionError::ProtocolViolation(
-                            super::DUPLICATE_FETCH_STREAM_REASON.to_string(),
-                        )
-                    } else {
-                        err.into()
-                    }
-                })?;
-                return Ok(());
-            }
-            match fetches.receive_terminal_stream(fetch.request_id) {
-                Some(false) => {
-                    drop(fetches);
-                    reader.stop(crate::data::DataStreamResetCode::Cancelled.into());
-                    return Ok(());
-                }
-                Some(true) => {
-                    return Err(SessionError::ProtocolViolation(
-                        super::DUPLICATE_FETCH_STREAM_REASON.to_string(),
-                    ));
-                }
-                None => {}
-            }
-            return Err(SessionError::Serve(ServeError::not_found_ctx(format!(
-                "fetch request {} not found",
-                fetch.request_id
-            ))));
+            let recv = fetches.get_mut(&fetch.request_id).ok_or_else(|| {
+                SessionError::Serve(ServeError::not_found_ctx(format!(
+                    "fetch request {} not found",
+                    fetch.request_id
+                )))
+            })?;
+            recv.recv_stream(reader)?;
+            return Ok(());
         }
 
         if !stream_header.header_type.is_subgroup() {
@@ -1829,43 +1735,6 @@ mod tests {
         assert_ne!(first_request.id, second_request.id);
     }
 
-    #[tokio::test]
-    async fn outbound_fetch_waits_for_more_request_ids() {
-        let request_id = RequestId::new(0, 2, 100, 0);
-        let mut subscriber = Subscriber::new(
-            Queue::default(),
-            Queue::default(),
-            None,
-            request_id.clone(),
-            PendingRequests::default(),
-            SessionId::generate(),
-        );
-        let mut outgoing = subscriber.outgoing.clone();
-        let first = subscriber
-            .fetch(standalone_fetch("video"), KeyValuePairs::default())
-            .unwrap();
-        assert!(matches!(outgoing.pop().await, Some(Message::Fetch(_))));
-
-        let second = subscriber.fetch_wait(standalone_fetch("audio"), KeyValuePairs::default());
-        tokio::pin!(second);
-        let blocked = tokio::select! {
-            _ = &mut second => panic!("FETCH completed before credit increased"),
-            message = outgoing.pop() => message.unwrap(),
-        };
-        assert!(matches!(
-            blocked,
-            Message::RequestsBlocked(message::RequestsBlocked { max_request_id: 2 })
-        ));
-
-        request_id
-            .apply_max_request_id(&message::MaxRequestId { request_id: 4 })
-            .unwrap();
-        let second = second.await.unwrap();
-        assert_eq!(second.request.id, 2);
-        drop(first);
-        drop(second);
-    }
-
     #[test]
     fn outbound_fetch_accepts_empty_equal_location_range() {
         let mut subscriber = subscriber();
@@ -1894,15 +1763,7 @@ mod tests {
             panic!("expected FETCH_CANCEL");
         };
         assert_eq!(cancel.id, request.id);
-        let mut fetches = subscriber.fetches.lock().unwrap();
-        assert!(fetches.active.is_empty());
-        assert_eq!(
-            fetches.terminal.iter().copied().collect::<Vec<_>>(),
-            [(request.id, false)]
-        );
-        assert_eq!(fetches.receive_terminal_stream(request.id), Some(false));
-        assert_eq!(fetches.receive_terminal_stream(request.id), Some(true));
-        drop(fetches);
+        assert!(subscriber.fetches.lock().unwrap().is_empty());
         assert!(outgoing.close().is_empty());
     }
 
@@ -1934,22 +1795,42 @@ mod tests {
     }
 
     #[test]
-    fn fetch_ok_outside_requested_range_is_rejected() {
+    fn fetch_ok_before_requested_start_is_rejected() {
         let mut subscriber = subscriber();
-        let fetch = subscriber
-            .fetch(standalone_fetch("video"), KeyValuePairs::default())
-            .unwrap();
+        let mut request = standalone_fetch("video");
+        request.start_location = crate::coding::Location::new(0, 5);
+        request.end_location = crate::coding::Location::new(0, 0);
+        let fetch = subscriber.fetch(request, KeyValuePairs::default()).unwrap();
 
         assert!(matches!(
             subscriber.recv_fetch_ok(&message::FetchOk {
                 id: fetch.request.id,
                 end_of_track: false,
-                end_location: crate::coding::Location::new(2, 0),
+                end_location: crate::coding::Location::new(0, 4),
                 params: Default::default(),
                 track_extensions: Default::default(),
             }),
             Err(SessionError::ProtocolViolation(_))
         ));
+    }
+
+    #[test]
+    fn fetch_ok_whole_group_end_includes_requested_start() {
+        let mut subscriber = subscriber();
+        let mut request = standalone_fetch("video");
+        request.start_location = crate::coding::Location::new(0, 5);
+        request.end_location = crate::coding::Location::new(0, 0);
+        let fetch = subscriber.fetch(request, KeyValuePairs::default()).unwrap();
+
+        assert!(subscriber
+            .recv_fetch_ok(&message::FetchOk {
+                id: fetch.request.id,
+                end_of_track: false,
+                end_location: crate::coding::Location::new(0, 0),
+                params: Default::default(),
+                track_extensions: Default::default(),
+            })
+            .is_ok());
     }
 
     #[tokio::test]
@@ -1999,19 +1880,6 @@ mod tests {
         assert!(fetch.ok().await.is_err());
         drop(fetch);
         assert!(outgoing.close().is_empty());
-    }
-
-    #[tokio::test]
-    async fn closing_session_wakes_active_fetches() {
-        let mut subscriber = subscriber();
-        let fetch = subscriber
-            .fetch(standalone_fetch("video"), KeyValuePairs::default())
-            .unwrap();
-
-        subscriber.close_fetches(ServeError::Done);
-
-        assert_eq!(fetch.ok().await.unwrap_err(), ServeError::Done);
-        assert!(subscriber.fetches.lock().unwrap().active.is_empty());
     }
 
     #[tokio::test]

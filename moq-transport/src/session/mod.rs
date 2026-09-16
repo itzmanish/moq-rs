@@ -54,7 +54,6 @@ use std::sync::{Arc, Mutex};
 use crate::coding::{KeyValuePairs, Value};
 use crate::message::Message;
 use crate::mlog;
-use crate::serve::ServeError;
 use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
@@ -139,7 +138,6 @@ const MAX_CONCURRENT_SUBSCRIBE_NAMESPACE_STREAMS: usize = 256;
 /// bidirectional stream before treating the peer as misbehaving. Prevents idle or
 /// malicious streams from occupying an accept slot indefinitely.
 const SUBSCRIBE_NAMESPACE_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const DUPLICATE_FETCH_STREAM_REASON: &str = "received multiple streams for one FETCH";
 
 /// Session-level protocol limits advertised during setup.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -181,9 +179,6 @@ pub struct Session {
     /// Outbound requests that are waiting for a terminal response.
     pending_requests: PendingRequests,
 
-    /// Wakes FETCH state even if the session runner is dropped before polling.
-    cleanup: SessionCleanup,
-
     /// Optional mlog writer for MoQ Transport events
     /// Wrapped in Arc<Mutex<>> to share across send/recv tasks when enabled
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
@@ -201,39 +196,6 @@ pub struct Session {
     /// Normally the QUIC connection ID hex, which the peer also observes and which names this
     /// connection's qlog and mlog files.
     session_id: SessionId,
-}
-
-struct SessionCleanup {
-    request_id: RequestId,
-    subscriber: Option<Subscriber>,
-    active: bool,
-}
-
-impl SessionCleanup {
-    fn new(request_id: RequestId, subscriber: Option<Subscriber>) -> Self {
-        Self {
-            request_id,
-            subscriber,
-            active: true,
-        }
-    }
-
-    fn close(&mut self, err: ServeError) {
-        if !self.active {
-            return;
-        }
-        self.active = false;
-        self.request_id.close();
-        if let Some(subscriber) = self.subscriber.take() {
-            subscriber.close_fetches(err);
-        }
-    }
-}
-
-impl Drop for SessionCleanup {
-    fn drop(&mut self) {
-        self.close(ServeError::Cancel);
-    }
 }
 
 impl Session {
@@ -653,9 +615,8 @@ impl Session {
             subscriber: subscriber.clone(),
             outgoing: outgoing.1,
             subscribe_namespace_open: subscribe_namespace_open.1,
-            request_id: request_id.clone(),
+            request_id,
             pending_requests,
-            cleanup: SessionCleanup::new(request_id, subscriber.clone()),
             mlog: mlog_shared,
             transport,
             connection_path,
@@ -996,23 +957,16 @@ impl Session {
     /// Run Tasks for the session, including sending of control messages, receiving and processing
     /// inbound control messages, receiving and processing new inbound uni-directional QUIC streams,
     /// and receiving and processing QUIC datagrams received
-    pub async fn run(mut self) -> Result<(), SessionError> {
-        let max_request_id_outgoing = self.outgoing.clone();
-        let result = tokio::select! {
-            res = Self::run_recv(self.session_id.clone(), self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone(), max_request_id_outgoing.clone()) => res,
+    pub async fn run(self) -> Result<(), SessionError> {
+        tokio::select! {
+            res = Self::run_recv(self.session_id.clone(), self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
             res = Self::run_send(self.session_id.clone(), self.sender, self.outgoing, self.mlog.clone()) => res,
             res = Self::run_subscribe_namespace_open(self.session_id.clone(), self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
-            res = Self::run_subscribe_namespace_accept(self.session_id.clone(), self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), max_request_id_outgoing, self.mlog.clone()) => res,
+            res = Self::run_subscribe_namespace_accept(self.session_id.clone(), self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), self.mlog.clone()) => res,
             res = Self::run_streams(self.session_id.clone(), self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
             res = Self::run_pending_timeouts(self.session_id, self.publisher, self.subscriber, self.pending_requests) => res,
-        };
-        let err = match &result {
-            Ok(()) => ServeError::Done,
-            Err(err) => ServeError::Closed(err.code()),
-        };
-        self.cleanup.close(err);
-        result
+        }
     }
 
     /// Processes the outgoing control message queue, and sends queued messages on the control stream sender/writer.
@@ -1120,7 +1074,6 @@ impl Session {
         webtransport: web_transport::Session,
         publisher: Option<Publisher>,
         request_id: RequestId,
-        outgoing: Queue<Message>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
@@ -1133,7 +1086,7 @@ impl Session {
                     let (send, recv) = stream?;
                     let publisher = publisher.clone().ok_or(SessionError::RoleViolation)?;
                     let request_id = request_id.clone();
-                    tasks.push(Self::accept_subscribe_namespace_stream(session_id.clone(), publisher, request_id, outgoing.clone(), send, recv, mlog.clone()));
+                    tasks.push(Self::accept_subscribe_namespace_stream(session_id.clone(), publisher, request_id, send, recv, mlog.clone()));
                 }
                 Some(res) = tasks.next(), if !tasks.is_empty() => res?,
             }
@@ -1144,7 +1097,6 @@ impl Session {
         session_id: SessionId,
         mut publisher: Publisher,
         request_id: RequestId,
-        mut outgoing: Queue<Message>,
         send: web_transport::SendStream,
         recv: web_transport::RecvStream,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
@@ -1180,11 +1132,7 @@ impl Session {
             mlog::events::subscribe_namespace_parsed(time, 0, &subscribe_namespace)
         });
 
-        request_id.validate_incoming_with_update(subscribe_namespace.id, |update| {
-            outgoing
-                .push(update.into())
-                .map_err(|_| SessionError::Internal)
-        })?;
+        request_id.validate_incoming(subscribe_namespace.id)?;
         let recv = publisher.recv_subscribe_namespace(subscribe_namespace)?;
         recv.run(writer, reader, mlog).await
     }
@@ -1203,7 +1151,6 @@ impl Session {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         pending_requests: PendingRequests,
-        mut outgoing: Queue<Message>,
     ) -> Result<(), SessionError> {
         let mut goaway_received = false;
 
@@ -1246,11 +1193,7 @@ impl Session {
             }
 
             if let Some(id) = msg.sequenced_request_id() {
-                request_id.validate_incoming_with_update(id, |update| {
-                    outgoing
-                        .push(update.into())
-                        .map_err(|_| SessionError::Internal)
-                })?;
+                request_id.validate_incoming(id)?;
             }
 
             let msg = match msg {
@@ -1518,31 +1461,14 @@ impl Session {
                     let session_id = session_id.clone();
 
                     tasks.push(async move {
-                        let result = Subscriber::recv_stream(subscriber, stream).await;
-                        (session_id, result)
+                        if let Err(err) = Subscriber::recv_stream(subscriber, stream).await {
+                            tracing::warn!(session_id = %session_id, "failed to serve stream: {}", err);
+                        };
                     });
                 },
-                Some((session_id, result)) = tasks.next(), if !tasks.is_empty() => {
-                    Self::handle_stream_result(&session_id, result)?;
-                },
+                _ = tasks.next(), if !tasks.is_empty() => {},
             };
         }
-    }
-
-    fn handle_stream_result(
-        session_id: &SessionId,
-        result: Result<(), SessionError>,
-    ) -> Result<(), SessionError> {
-        if let Err(err) = result {
-            if matches!(
-                &err,
-                SessionError::ProtocolViolation(reason) if reason == DUPLICATE_FETCH_STREAM_REASON
-            ) {
-                return Err(err);
-            }
-            tracing::warn!(session_id = %session_id, "failed to serve stream: {}", err);
-        }
-        Ok(())
     }
 
     /// Receives QUIC datagrams and processes them using the Subscriber logic
@@ -1595,75 +1521,6 @@ mod tests {
 
         let output = capture.0.lock().unwrap().clone();
         String::from_utf8(output).unwrap()
-    }
-
-    fn standalone_fetch() -> message::StandaloneFetch {
-        message::StandaloneFetch {
-            track_namespace: crate::coding::TrackNamespace::from_utf8_path("test"),
-            track_name: "video".into(),
-            start_location: crate::coding::Location::new(0, 0),
-            end_location: crate::coding::Location::new(1, 0),
-        }
-    }
-
-    #[tokio::test]
-    async fn dropping_session_cleanup_wakes_active_fetch() {
-        let request_id = RequestId::new(0, 100, 100, 0);
-        let mut subscriber = Subscriber::new(
-            Queue::default(),
-            Queue::default(),
-            None,
-            request_id.clone(),
-            PendingRequests::default(),
-            SessionId::generate(),
-        );
-        let fetch = subscriber
-            .fetch(standalone_fetch(), KeyValuePairs::default())
-            .unwrap();
-        let cleanup = SessionCleanup::new(request_id, Some(subscriber));
-
-        drop(cleanup);
-
-        assert_eq!(fetch.ok().await.unwrap_err(), ServeError::Cancel);
-    }
-
-    #[tokio::test]
-    async fn dropping_session_cleanup_wakes_request_credit_waiter() {
-        let request_id = RequestId::new(0, 0, 100, 0);
-        let cleanup = SessionCleanup::new(request_id.clone(), None);
-
-        drop(cleanup);
-
-        assert!(request_id.wait_for_send_credit().await.is_err());
-    }
-
-    #[test]
-    fn benign_stream_not_found_does_not_stop_session_loop() {
-        let session_id = SessionId::generate();
-        assert!(Session::handle_stream_result(
-            &session_id,
-            Err(SessionError::Serve(ServeError::NotFound))
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn only_duplicate_fetch_stream_violation_stops_session_loop() {
-        let session_id = SessionId::generate();
-        assert!(Session::handle_stream_result(
-            &session_id,
-            Err(SessionError::unimplemented("non-SUBGROUP stream types"))
-        )
-        .is_ok());
-        assert!(matches!(
-            Session::handle_stream_result(
-                &session_id,
-                Err(SessionError::ProtocolViolation(
-                    DUPLICATE_FETCH_STREAM_REASON.to_string()
-                ))
-            ),
-            Err(SessionError::ProtocolViolation(_))
-        ));
     }
 
     // ========================================================================

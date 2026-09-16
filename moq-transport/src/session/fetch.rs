@@ -9,11 +9,6 @@ use crate::{
 
 use super::{Reader, Subscriber};
 
-#[cfg(not(test))]
-const FETCH_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-#[cfg(test)]
-const FETCH_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
-
 struct FetchState {
     reader: Option<Reader>,
     ok: Option<FetchOk>,
@@ -48,16 +43,15 @@ pub struct Fetch {
 pub(crate) struct FetchRecv {
     state: State<FetchState>,
     pub start: crate::coding::Location,
-    pub end: crate::coding::Location,
 }
 
 impl Fetch {
     pub(super) fn new(subscriber: Subscriber, request: message::Fetch) -> (Self, FetchRecv) {
         let id = request.id;
-        let (start, end) = request
+        let start = request
             .standalone_fetch
             .as_ref()
-            .map(|fetch| (fetch.start_location, fetch.end_location))
+            .map(|fetch| fetch.start_location)
             .unwrap_or_default();
         let (send, recv) = State::default().split();
         (
@@ -69,11 +63,7 @@ impl Fetch {
                 id,
                 request,
             },
-            FetchRecv {
-                state: recv,
-                start,
-                end,
-            },
+            FetchRecv { state: recv, start },
         )
     }
 
@@ -116,23 +106,19 @@ impl Fetch {
     }
 
     async fn ensure_reader(&mut self) -> Result<(), ServeError> {
-        tokio::time::timeout(FETCH_STREAM_TIMEOUT, async {
-            while self.reader.is_none() {
-                let notify = {
-                    let state = self.state.lock();
-                    state.closed.clone()?;
-                    if state.reader.is_some() {
-                        self.reader = state.into_mut().and_then(|mut state| state.reader.take());
-                        continue;
-                    }
-                    state.modified().ok_or(ServeError::Done)?
-                };
-                notify.await;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|_| ServeError::internal_ctx("FETCH stream timed out"))?
+        while self.reader.is_none() {
+            let notify = {
+                let state = self.state.lock();
+                state.closed.clone()?;
+                if state.reader.is_some() {
+                    self.reader = state.into_mut().and_then(|mut state| state.reader.take());
+                    continue;
+                }
+                state.modified().ok_or(ServeError::Done)?
+            };
+            notify.await;
+        }
+        Ok(())
     }
 }
 
@@ -149,10 +135,6 @@ impl Drop for Fetch {
 }
 
 impl FetchRecv {
-    pub fn stream_received(&self) -> bool {
-        self.state.lock().stream_received
-    }
-
     pub fn recv_ok(&mut self, ok: &FetchOk) -> Result<(), ServeError> {
         let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
         if state.ok.is_some() {
@@ -199,59 +181,5 @@ async fn wait_closed(state: State<FetchState>) -> ServeError {
             Some(notify) => notify.await,
             None => return ServeError::Done,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use crate::{
-        coding::{KeyValuePairs, Location, TrackNamespace},
-        message::{self, FetchType},
-        watch::Queue,
-    };
-
-    use super::*;
-    use crate::session::{PendingRequests, RequestId, SessionId};
-
-    fn subscriber() -> Subscriber {
-        Subscriber::new(
-            Queue::default(),
-            Queue::default(),
-            None,
-            RequestId::new(0, 100, 100, 0),
-            PendingRequests::default(),
-            SessionId::generate(),
-        )
-    }
-
-    #[tokio::test]
-    async fn fetch_ok_without_stream_times_out() {
-        let request = message::Fetch {
-            id: 0,
-            fetch_type: FetchType::Standalone,
-            standalone_fetch: Some(message::StandaloneFetch {
-                track_namespace: TrackNamespace::from_utf8_path("test"),
-                track_name: "video".into(),
-                start_location: Location::new(0, 0),
-                end_location: Location::new(1, 0),
-            }),
-            joining_fetch: None,
-            params: KeyValuePairs::default(),
-        };
-        let (mut fetch, mut recv) = Fetch::new(subscriber(), request);
-        recv.recv_ok(&message::FetchOk {
-            id: 0,
-            end_of_track: false,
-            end_location: Location::new(1, 0),
-            params: KeyValuePairs::default(),
-            track_extensions: Default::default(),
-        })
-        .unwrap();
-        let result =
-            tokio::time::timeout(Duration::from_millis(20), fetch.read_stream_chunk(1)).await;
-
-        assert!(matches!(result, Ok(Err(_))));
     }
 }
