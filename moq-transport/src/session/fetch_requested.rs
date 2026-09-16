@@ -327,6 +327,45 @@ mod tests {
         }
     }
 
+    async fn webtransport_pair() -> (
+        web_transport::Session,
+        web_transport::Session,
+        web_transport::quinn::Client,
+        web_transport::quinn::quinn::Endpoint,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let certified =
+                rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            let certificate = certified.cert.der().clone();
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()),
+            );
+            let mut server = web_transport::quinn::ServerBuilder::new()
+                .with_addr("0.0.0.0:0".parse().unwrap())
+                .with_certificate(vec![certificate.clone()], key)
+                .unwrap();
+            let port = server.local_addr().unwrap().port();
+            let client = web_transport::quinn::ClientBuilder::new()
+                .with_server_certificates(vec![certificate])
+                .unwrap();
+            let client_keepalive = client.clone();
+            let server_keepalive = (*server).clone();
+            let url = url::Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
+            let (client_session, server_session) = tokio::join!(client.connect(url), async move {
+                server.accept().await.unwrap().ok().await
+            });
+            (
+                client_session.unwrap().into(),
+                server_session.unwrap().into(),
+                client_keepalive,
+                server_keepalive,
+            )
+        })
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn reject_sends_one_error_and_removes_active_state() {
         let Handles {
@@ -433,5 +472,70 @@ mod tests {
         assert_eq!(mapped.error_code, error.error_code);
         assert_eq!(mapped.retry_interval, error.retry_interval);
         assert_eq!(mapped.reason, error.reason);
+    }
+
+    #[tokio::test]
+    async fn proxy_waits_for_request_error_after_stream_reset() {
+        let (upstream_receive, upstream_send, _upstream_client, _upstream_server) =
+            webtransport_pair().await;
+        let _upstream_keepalive = upstream_send.clone();
+        let subscriber = super::super::Subscriber::new(
+            Queue::default(),
+            Queue::default(),
+            None,
+            super::super::RequestId::new(0, 100, 100, 0),
+            super::super::PendingRequests::default(),
+            super::super::SessionId::generate(),
+        );
+        let (upstream, mut upstream_recv) = super::super::Fetch::new(subscriber, request(64));
+        let (accepted, wait_accepted) = tokio::sync::oneshot::channel();
+        let send_reset = async move {
+            let mut stream = upstream_send.open_uni().await.unwrap();
+            stream.write(b"x").await.unwrap();
+            wait_accepted.await.unwrap();
+            stream.reset(DataStreamResetCode::InternalError.into());
+        };
+        let receive_reset = async {
+            let stream = upstream_receive.accept_uni().await.unwrap();
+            accepted.send(()).unwrap();
+            upstream_recv
+                .recv_stream(super::super::Reader::new(SessionId::generate(), stream))
+                .unwrap();
+        };
+        tokio::join!(send_reset, receive_reset);
+
+        let (downstream_send, _downstream_receive, _downstream_client, _downstream_server) =
+            webtransport_pair().await;
+        let _downstream_keepalive = downstream_send.clone();
+        let Handles {
+            mut request,
+            recv,
+            _keepalive,
+            mut outgoing,
+            active,
+        } = handles(7);
+        active.lock().unwrap().insert(7, recv);
+        request.webtransport = Some(downstream_send);
+        let expected =
+            message::RequestError::new(64, RequestErrorCode::DoesNotExist, 42, "origin failed");
+        let deliver_error = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            upstream_recv.recv_error(&expected).unwrap();
+        };
+
+        let (result, ()) = tokio::join!(
+            request.proxy(upstream, Duration::from_secs(5)),
+            deliver_error
+        );
+
+        assert!(result.is_err());
+        let Message::RequestError(error) = outgoing.pop().await.unwrap() else {
+            panic!("expected REQUEST_ERROR");
+        };
+        assert_eq!(error.id, 7);
+        assert_eq!(error.error_code, RequestErrorCode::DoesNotExist as u64);
+        assert_eq!(error.retry_interval, 42);
+        assert_eq!(error.reason.0, "origin failed");
+        assert!(active.lock().unwrap().is_empty());
     }
 }

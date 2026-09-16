@@ -1051,48 +1051,12 @@ mod tests {
 
             write(&mut downstream.control_send, &fetch_request(6, &namespace)).await;
             let Message::Fetch(request) = upstream.control_recv.decode::<Message>().await else {
-                panic!("expected reset upstream FETCH");
-            };
-            assert!(upstream_ids.insert(request.id));
-            let mut stream = upstream.transport.open_uni().await.unwrap();
-            write(
-                &mut stream,
-                &FetchHeader {
-                    header_type: StreamHeaderType::Fetch,
-                    request_id: request.id,
-                },
-            )
-            .await;
-            write_bytes(&mut stream, b"x").await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            stream.reset(moq_transport::data::DataStreamResetCode::InternalError.into());
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            write(
-                &mut upstream.control_send,
-                &Message::RequestError(message::RequestError::new(
-                    request.id,
-                    RequestErrorCode::DoesNotExist,
-                    42,
-                    "reset miss",
-                )),
-            )
-            .await;
-            let Message::RequestError(error) = downstream.control_recv.decode::<Message>().await
-            else {
-                panic!("expected reset REQUEST_ERROR");
-            };
-            assert_eq!(error.id, 6);
-            assert_eq!(error.retry_interval, 42);
-            assert_eq!(error.reason.0, "reset miss");
-
-            write(&mut downstream.control_send, &fetch_request(8, &namespace)).await;
-            let Message::Fetch(request) = upstream.control_recv.decode::<Message>().await else {
                 panic!("expected cancellable upstream FETCH");
             };
             assert!(upstream_ids.insert(request.id));
             write(
                 &mut downstream.control_send,
-                &Message::FetchCancel(message::FetchCancel { id: 8 }),
+                &Message::FetchCancel(message::FetchCancel { id: 6 }),
             )
             .await;
             assert!(matches!(
