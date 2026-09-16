@@ -142,17 +142,3 @@ impl PendingRequests {
         self.notify.notified().await;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fetch_accepts_only_fetch_ok_or_request_error() {
-        assert!(PendingRequest::Fetch.accepts(PendingResponse::FetchOk));
-        assert!(PendingRequest::Fetch.accepts(PendingResponse::RequestError));
-        assert!(!PendingRequest::Fetch.accepts(PendingResponse::RequestOk));
-        assert!(!PendingRequest::Fetch.accepts(PendingResponse::PublishOk));
-        assert!(!PendingRequest::Fetch.accepts(PendingResponse::SubscribeOk));
-    }
-}

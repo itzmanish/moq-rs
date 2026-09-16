@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
     coding::{KeyValuePairs, TrackNamespace},
@@ -190,9 +191,12 @@ impl Producer {
             Ok(params) => params,
             Err(err) => {
                 fetch.reject(RequestErrorCode::InternalError, "invalid FETCH parameters")?;
-                return Err(err.into());
+                return Err(err).context("invalid FETCH parameters");
             }
         };
+        if fetch.closed().now_or_never().is_some() {
+            return Ok(());
+        }
         let upstream = match source.fetch(standalone.clone(), params) {
             Ok(upstream) => upstream,
             Err(err) => {
@@ -200,7 +204,7 @@ impl Producer {
                     RequestErrorCode::InternalError,
                     "failed to open upstream FETCH",
                 )?;
-                return Err(err.into());
+                return Err(err).context("failed to open upstream FETCH");
             }
         };
         fetch
@@ -723,9 +727,6 @@ fn upstream_fetch_params(
     params: &KeyValuePairs,
 ) -> Result<KeyValuePairs, moq_transport::coding::DecodeError> {
     let mut upstream = KeyValuePairs::default();
-    if let Some(priority) = params.subscriber_priority()? {
-        upstream.set_subscriber_priority(priority);
-    }
     if let Some(order) = params.group_order()? {
         upstream.set_group_order(order);
     }
@@ -1088,7 +1089,7 @@ mod tests {
 
         let upstream = upstream_fetch_params(&params).unwrap();
 
-        assert_eq!(upstream.subscriber_priority().unwrap(), Some(7));
+        assert_eq!(upstream.subscriber_priority().unwrap(), None);
         assert_eq!(
             upstream.group_order().unwrap(),
             Some(GroupOrder::Descending)

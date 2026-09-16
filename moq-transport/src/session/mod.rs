@@ -1461,12 +1461,19 @@ impl Session {
                     let session_id = session_id.clone();
 
                     tasks.push(async move {
-                        if let Err(err) = Subscriber::recv_stream(subscriber, stream).await {
-                            tracing::warn!(session_id = %session_id, "failed to serve stream: {}", err);
-                        };
+                        let result = Subscriber::recv_stream(subscriber, stream).await;
+                        (session_id, result)
                     });
                 },
-                _ = tasks.next(), if !tasks.is_empty() => {},
+                Some((session_id, result)) = tasks.next(), if !tasks.is_empty() => {
+                    if let Err(err) = result {
+                        if err.is_stream_error() {
+                            tracing::warn!(session_id = %session_id, "failed to serve stream: {}", err);
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                },
             };
         }
     }

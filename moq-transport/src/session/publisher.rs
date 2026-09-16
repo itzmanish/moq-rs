@@ -664,6 +664,7 @@ impl Publisher {
             .standalone_fetch
             .as_ref()
             .ok_or(SessionError::Internal)?;
+        validate_fetch_params(&msg.params)?;
         if standalone.start_location != standalone.end_location
             && standalone.start_location
                 > super::fetch_requested::inclusive_end(standalone.end_location)
@@ -687,6 +688,7 @@ impl Publisher {
             self.fetches.clone(),
             msg,
         );
+        // Sequenced request IDs are validated by Session::run_recv before dispatch.
         self.fetches
             .lock()
             .map_err(|_| SessionError::Internal)?
@@ -1137,6 +1139,12 @@ impl Publisher {
     }
 }
 
+fn validate_fetch_params(params: &KeyValuePairs) -> Result<(), crate::coding::DecodeError> {
+    params.subscriber_priority()?;
+    params.group_order()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1147,13 +1155,24 @@ mod tests {
         serve::FullTrackName,
     };
 
-    use super::{NameRegistry, Publisher};
+    use super::{validate_fetch_params, NameRegistry, Publisher};
 
     fn full_track_name(namespace: &str, name: &str) -> FullTrackName {
         FullTrackName {
             namespace: TrackNamespace::from_utf8_path(namespace),
             name: TrackName::from(name),
         }
+    }
+
+    #[test]
+    fn fetch_parameters_reject_invalid_known_values() {
+        let mut priority = crate::coding::KeyValuePairs::default();
+        priority.set_intvalue(crate::message::parameter_type::SUBSCRIBER_PRIORITY, 256);
+        assert!(validate_fetch_params(&priority).is_err());
+
+        let mut order = crate::coding::KeyValuePairs::default();
+        order.set_intvalue(crate::message::parameter_type::GROUP_ORDER, 0);
+        assert!(validate_fetch_params(&order).is_err());
     }
 
     #[test]

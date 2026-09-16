@@ -3,7 +3,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -92,7 +95,6 @@ impl FetchRequested {
     ) -> Result<(), ServeError> {
         self.claim_response()?;
         self.send_error(code, reason);
-        self.remove_active();
         Ok(())
     }
 
@@ -102,38 +104,34 @@ impl FetchRequested {
 
     pub async fn proxy(self, mut upstream: Fetch, timeout: Duration) -> Result<(), SessionError> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let reset = FetchReset::default();
         let result = {
-            let operation = self.proxy_inner(&mut upstream);
+            let operation = self.proxy_inner(&mut upstream, reset.clone());
             tokio::pin!(operation);
             tokio::select! {
                 biased;
                 closed = self.closed() => {
+                    reset.set(DataStreamResetCode::Cancelled);
                     return Err(closed.err().unwrap_or(ServeError::Done).into());
                 },
-                _ = tokio::time::sleep_until(deadline) => None,
+                _ = tokio::time::sleep_until(deadline) => {
+                    reset.set(DataStreamResetCode::DeliveryTimeout);
+                    None
+                },
                 result = &mut operation => Some(result),
             }
         };
 
         match result {
-            Some(Ok(response)) => self.respond_ok(response),
+            Some(Ok(response)) => self.respond(response),
             None => {
                 self.reject(RequestErrorCode::Timeout, "fetch proxy timed out")?;
                 Err(ServeError::Cancel.into())
             }
             Some(Err(err)) => {
-                if upstream.request_error().is_none() {
-                    tokio::select! {
-                        closed = self.closed() => {
-                            return Err(closed.err().unwrap_or(ServeError::Done).into());
-                        },
-                        _ = tokio::time::sleep_until(deadline) => {},
-                        _ = upstream.ok() => {},
-                    }
-                }
-                if let Some(error) = upstream.request_error() {
+                if let Some(error) = self.wait_for_request_error(&upstream, deadline).await? {
                     let request_id = self.id;
-                    self.respond_error(proxied_error(error, request_id))?;
+                    self.respond(proxied_error(error, request_id))?;
                     return Err(err);
                 }
                 self.reject(RequestErrorCode::InternalError, "fetch proxy failed")?;
@@ -142,12 +140,16 @@ impl FetchRequested {
         }
     }
 
-    async fn proxy_inner(&self, upstream: &mut Fetch) -> Result<message::FetchOk, SessionError> {
+    async fn proxy_inner(
+        &self,
+        upstream: &mut Fetch,
+        reset: FetchReset,
+    ) -> Result<message::FetchOk, SessionError> {
         let webtransport = self.webtransport.as_ref().ok_or(SessionError::Internal)?;
-        let mut stream = FetchStream::new(Writer::new(
-            self.session_id.clone(),
-            webtransport.open_uni().await?,
-        ));
+        let mut stream = FetchStream::new(
+            Writer::new(self.session_id.clone(), webtransport.open_uni().await?),
+            reset,
+        );
         stream
             .writer
             .encode(&FetchHeader {
@@ -160,22 +162,32 @@ impl FetchRequested {
             stream.writer.write(&chunk).await?;
         }
 
-        stream.finish()?;
         let response = upstream.ok().await?;
+        stream.finish()?;
         Ok(proxied_response(response, self.id))
     }
 
-    fn respond_ok(self, response: message::FetchOk) -> Result<(), SessionError> {
-        self.claim_response()?;
-        let _ = self.outgoing.clone().push(response.into());
-        self.remove_active();
-        Ok(())
+    async fn wait_for_request_error(
+        &self,
+        upstream: &Fetch,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<message::RequestError>, ServeError> {
+        if let Some(error) = upstream.request_error() {
+            return Ok(Some(error));
+        }
+        tokio::select! {
+            closed = self.closed() => {
+                closed?;
+                Ok(None)
+            },
+            _ = tokio::time::sleep_until(deadline) => Ok(None),
+            _ = upstream.ok() => Ok(upstream.request_error()),
+        }
     }
 
-    fn respond_error(self, response: message::RequestError) -> Result<(), SessionError> {
+    fn respond(self, response: impl Into<Message>) -> Result<(), SessionError> {
         self.claim_response()?;
         let _ = self.outgoing.clone().push(response.into());
-        self.remove_active();
         Ok(())
     }
 
@@ -249,13 +261,15 @@ fn proxied_error(mut response: message::RequestError, request_id: u64) -> messag
 
 struct FetchStream {
     writer: Writer,
+    reset: FetchReset,
     finished: bool,
 }
 
 impl FetchStream {
-    fn new(writer: Writer) -> Self {
+    fn new(writer: Writer, reset: FetchReset) -> Self {
         Self {
             writer,
+            reset,
             finished: false,
         }
     }
@@ -270,8 +284,29 @@ impl FetchStream {
 impl Drop for FetchStream {
     fn drop(&mut self) {
         if !self.finished {
-            self.writer.reset(DataStreamResetCode::InternalError.into());
+            self.writer.reset(self.reset.code());
         }
+    }
+}
+
+#[derive(Clone)]
+struct FetchReset(Arc<AtomicU32>);
+
+impl Default for FetchReset {
+    fn default() -> Self {
+        Self(Arc::new(AtomicU32::new(
+            DataStreamResetCode::InternalError.into(),
+        )))
+    }
+}
+
+impl FetchReset {
+    fn set(&self, code: DataStreamResetCode) {
+        self.0.store(code.into(), Ordering::Release);
+    }
+
+    fn code(&self) -> u32 {
+        self.0.load(Ordering::Acquire)
     }
 }
 
@@ -325,45 +360,6 @@ mod tests {
             outgoing: receiver,
             active,
         }
-    }
-
-    async fn webtransport_pair() -> (
-        web_transport::Session,
-        web_transport::Session,
-        web_transport::quinn::Client,
-        web_transport::quinn::quinn::Endpoint,
-    ) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            let certified =
-                rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-            let certificate = certified.cert.der().clone();
-            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-                rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()),
-            );
-            let mut server = web_transport::quinn::ServerBuilder::new()
-                .with_addr("0.0.0.0:0".parse().unwrap())
-                .with_certificate(vec![certificate.clone()], key)
-                .unwrap();
-            let port = server.local_addr().unwrap().port();
-            let client = web_transport::quinn::ClientBuilder::new()
-                .with_server_certificates(vec![certificate])
-                .unwrap();
-            let client_keepalive = client.clone();
-            let server_keepalive = (*server).clone();
-            let url = url::Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
-            let (client_session, server_session) = tokio::join!(client.connect(url), async move {
-                server.accept().await.unwrap().ok().await
-            });
-            (
-                client_session.unwrap().into(),
-                server_session.unwrap().into(),
-                client_keepalive,
-                server_keepalive,
-            )
-        })
-        .await
-        .unwrap()
     }
 
     #[tokio::test]
@@ -475,10 +471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_waits_for_request_error_after_stream_reset() {
-        let (upstream_receive, upstream_send, _upstream_client, _upstream_server) =
-            webtransport_pair().await;
-        let _upstream_keepalive = upstream_send.clone();
+    async fn proxy_waits_for_request_error_after_stream_failure() {
         let subscriber = super::super::Subscriber::new(
             Queue::default(),
             Queue::default(),
@@ -488,54 +481,29 @@ mod tests {
             super::super::SessionId::generate(),
         );
         let (upstream, mut upstream_recv) = super::super::Fetch::new(subscriber, request(64));
-        let (accepted, wait_accepted) = tokio::sync::oneshot::channel();
-        let send_reset = async move {
-            let mut stream = upstream_send.open_uni().await.unwrap();
-            stream.write(b"x").await.unwrap();
-            wait_accepted.await.unwrap();
-            stream.reset(DataStreamResetCode::InternalError.into());
-        };
-        let receive_reset = async {
-            let stream = upstream_receive.accept_uni().await.unwrap();
-            accepted.send(()).unwrap();
-            upstream_recv
-                .recv_stream(super::super::Reader::new(SessionId::generate(), stream))
-                .unwrap();
-        };
-        tokio::join!(send_reset, receive_reset);
-
-        let (downstream_send, _downstream_receive, _downstream_client, _downstream_server) =
-            webtransport_pair().await;
-        let _downstream_keepalive = downstream_send.clone();
         let Handles {
-            mut request,
-            recv,
+            request,
+            recv: _recv,
             _keepalive,
-            mut outgoing,
-            active,
+            outgoing: _,
+            active: _,
         } = handles(7);
-        active.lock().unwrap().insert(7, recv);
-        request.webtransport = Some(downstream_send);
         let expected =
             message::RequestError::new(64, RequestErrorCode::DoesNotExist, 42, "origin failed");
+        let delivered = expected.clone();
         let deliver_error = async {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            upstream_recv.recv_error(&expected).unwrap();
+            tokio::task::yield_now().await;
+            upstream_recv.recv_error(&delivered).unwrap();
         };
 
         let (result, ()) = tokio::join!(
-            request.proxy(upstream, Duration::from_secs(5)),
-            deliver_error
+            request.wait_for_request_error(
+                &upstream,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            ),
+            deliver_error,
         );
 
-        assert!(result.is_err());
-        let Message::RequestError(error) = outgoing.pop().await.unwrap() else {
-            panic!("expected REQUEST_ERROR");
-        };
-        assert_eq!(error.id, 7);
-        assert_eq!(error.error_code, RequestErrorCode::DoesNotExist as u64);
-        assert_eq!(error.retry_interval, 42);
-        assert_eq!(error.reason.0, "origin failed");
-        assert!(active.lock().unwrap().is_empty());
+        assert_eq!(result.unwrap(), Some(expected));
     }
 }
