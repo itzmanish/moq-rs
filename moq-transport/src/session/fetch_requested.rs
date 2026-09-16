@@ -101,6 +101,7 @@ impl FetchRequested {
     }
 
     pub async fn proxy(self, mut upstream: Fetch, timeout: Duration) -> Result<(), SessionError> {
+        let deadline = tokio::time::Instant::now() + timeout;
         let result = {
             let operation = self.proxy_inner(&mut upstream);
             tokio::pin!(operation);
@@ -109,7 +110,7 @@ impl FetchRequested {
                 closed = self.closed() => {
                     return Err(closed.err().unwrap_or(ServeError::Done).into());
                 },
-                _ = tokio::time::sleep(timeout) => None,
+                _ = tokio::time::sleep_until(deadline) => None,
                 result = &mut operation => Some(result),
             }
         };
@@ -121,6 +122,15 @@ impl FetchRequested {
                 Err(ServeError::Cancel.into())
             }
             Some(Err(err)) => {
+                if upstream.request_error().is_none() {
+                    tokio::select! {
+                        closed = self.closed() => {
+                            return Err(closed.err().unwrap_or(ServeError::Done).into());
+                        },
+                        _ = tokio::time::sleep_until(deadline) => {},
+                        _ = upstream.ok() => {},
+                    }
+                }
                 if let Some(error) = upstream.request_error() {
                     let request_id = self.id;
                     self.respond_error(proxied_error(error, request_id))?;
@@ -324,6 +334,17 @@ mod tests {
         web_transport::quinn::Client,
         web_transport::quinn::quinn::Endpoint,
     ) {
+        tokio::time::timeout(Duration::from_secs(5), webtransport_pair_inner())
+            .await
+            .unwrap()
+    }
+
+    async fn webtransport_pair_inner() -> (
+        web_transport::Session,
+        web_transport::Session,
+        web_transport::quinn::Client,
+        web_transport::quinn::quinn::Endpoint,
+    ) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let certificate = certified.cert.der().clone();
@@ -461,7 +482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_rewrites_header_and_copies_body() {
+    async fn publisher_to_relay_to_subscriber_copies_body() {
         let (upstream_receive, upstream_send, _upstream_client, _upstream_server) =
             webtransport_pair().await;
         let _upstream_keepalive = upstream_send.clone();
@@ -518,7 +539,7 @@ mod tests {
         request.request.id = 999;
         upstream.request.id = 888;
 
-        let proxy = request.proxy(upstream, Duration::from_secs(1));
+        let proxy = request.proxy(upstream, Duration::from_secs(5));
         let receive = async {
             let stream = downstream_receive.accept_uni().await.unwrap();
             let mut reader = super::super::Reader::new(SessionId::generate(), stream);
@@ -539,6 +560,71 @@ mod tests {
         };
         assert_eq!(ok.id, 7);
         assert!(ok.end_of_track);
+        assert!(active.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn proxy_waits_for_request_error_after_stream_reset() {
+        let (upstream_receive, upstream_send, _upstream_client, _upstream_server) =
+            webtransport_pair().await;
+        let _upstream_keepalive = upstream_send.clone();
+        let subscriber = super::super::Subscriber::new(
+            Queue::default(),
+            Queue::default(),
+            None,
+            super::super::RequestId::new(0, 100, 100, 0),
+            super::super::PendingRequests::default(),
+            super::super::SessionId::generate(),
+        );
+        let (upstream, mut upstream_recv) = super::super::Fetch::new(subscriber, request(64));
+        let (accepted, wait_accepted) = tokio::sync::oneshot::channel();
+        let send_reset = async move {
+            let mut stream = upstream_send.open_uni().await.unwrap();
+            stream.write(b"x").await.unwrap();
+            wait_accepted.await.unwrap();
+            stream.reset(DataStreamResetCode::InternalError.into());
+        };
+        let receive_reset = async {
+            let stream = upstream_receive.accept_uni().await.unwrap();
+            accepted.send(()).unwrap();
+            upstream_recv
+                .recv_stream(super::super::Reader::new(SessionId::generate(), stream))
+                .unwrap();
+        };
+        tokio::join!(send_reset, receive_reset);
+
+        let (downstream_send, _downstream_receive, _downstream_client, _downstream_server) =
+            webtransport_pair().await;
+        let _downstream_keepalive = downstream_send.clone();
+        let Handles {
+            mut request,
+            recv,
+            _keepalive,
+            mut outgoing,
+            active,
+        } = handles(7);
+        active.lock().unwrap().insert(7, recv);
+        request.webtransport = Some(downstream_send);
+        let expected =
+            message::RequestError::new(64, RequestErrorCode::DoesNotExist, 42, "origin failed");
+        let deliver_error = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            upstream_recv.recv_error(&expected).unwrap();
+        };
+
+        let (result, ()) = tokio::join!(
+            request.proxy(upstream, Duration::from_secs(5)),
+            deliver_error
+        );
+
+        assert!(result.is_err());
+        let Message::RequestError(error) = outgoing.pop().await.unwrap() else {
+            panic!("expected REQUEST_ERROR");
+        };
+        assert_eq!(error.id, 7);
+        assert_eq!(error.error_code, RequestErrorCode::DoesNotExist as u64);
+        assert_eq!(error.retry_interval, 42);
+        assert_eq!(error.reason.0, "origin failed");
         assert!(active.lock().unwrap().is_empty());
     }
 }

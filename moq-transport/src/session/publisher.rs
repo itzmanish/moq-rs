@@ -664,8 +664,9 @@ impl Publisher {
             .standalone_fetch
             .as_ref()
             .ok_or(SessionError::Internal)?;
-        if standalone.start_location
-            > super::fetch_requested::inclusive_end(standalone.end_location)
+        if standalone.start_location != standalone.end_location
+            && standalone.start_location
+                > super::fetch_requested::inclusive_end(standalone.end_location)
         {
             self.send_request_error(
                 "fetch",

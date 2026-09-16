@@ -3,13 +3,17 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
     coding::{KeyValuePairs, TrackNamespace},
-    message::SubscribeOptions,
+    message::{RequestErrorCode, SubscribeOptions},
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
-    session::{Publisher, SessionError, Subscribed, SubscribedNamespace, TrackStatusRequested},
+    session::{
+        FetchRequested, Publisher, SessionError, Subscribed, SubscribedNamespace,
+        TrackStatusRequested,
+    },
 };
 use tokio::sync::broadcast;
 
@@ -91,6 +95,7 @@ impl Producer {
             let mut publisher_subscribed = self.publisher.clone();
             let mut publisher_track_status = self.publisher.clone();
             let mut publisher_subscribed_namespace = self.publisher.clone();
+            let mut publisher_fetch = self.publisher.clone();
 
             tokio::select! {
                 // Handle a new subscribe request
@@ -150,10 +155,61 @@ impl Producer {
                         }
                     }.boxed())
                 },
+                Some(fetch) = publisher_fetch.fetch_requested() => {
+                    let this = self.clone();
+                    tasks.push(async move {
+                        if let Err(err) = this.serve_fetch(fetch).await {
+                            tracing::debug!(error = %err, "failed serving FETCH");
+                        }
+                    }.boxed())
+                },
                 _= tasks.next(), if !tasks.is_empty() => {},
                 else => return Ok(()),
             };
         }
+    }
+
+    async fn serve_fetch(self, fetch: FetchRequested) -> Result<(), anyhow::Error> {
+        let deadline = fetch.deadline(Duration::from_secs(30));
+        let standalone = fetch
+            .request
+            .standalone_fetch
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("standalone FETCH missing range"))?;
+        let Some(mut source) = self
+            .locals
+            .fetch_source(self.context.scope(), &standalone.track_namespace)
+        else {
+            fetch.reject(
+                RequestErrorCode::NotSupported,
+                "FETCH requires a local namespace publisher",
+            )?;
+            return Ok(());
+        };
+        let params = match upstream_fetch_params(&fetch.request.params) {
+            Ok(params) => params,
+            Err(err) => {
+                fetch.reject(RequestErrorCode::InternalError, "invalid FETCH parameters")?;
+                return Err(err.into());
+            }
+        };
+        let upstream = match source.fetch(standalone.clone(), params) {
+            Ok(upstream) => upstream,
+            Err(err) => {
+                fetch.reject(
+                    RequestErrorCode::InternalError,
+                    "failed to open upstream FETCH",
+                )?;
+                return Err(err.into());
+            }
+        };
+        fetch
+            .proxy(
+                upstream,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Serve a subscribe request.
@@ -663,11 +719,383 @@ fn full_name_for_track(track: &TrackReader) -> FullTrackName {
     }
 }
 
+fn upstream_fetch_params(
+    params: &KeyValuePairs,
+) -> Result<KeyValuePairs, moq_transport::coding::DecodeError> {
+    let mut upstream = KeyValuePairs::default();
+    if let Some(priority) = params.subscriber_priority()? {
+        upstream.set_subscriber_priority(priority);
+    }
+    if let Some(order) = params.group_order()? {
+        upstream.set_group_order(order);
+    }
+    Ok(upstream)
+}
+
 #[cfg(test)]
 mod tests {
-    use moq_transport::{serve::ServeError, session::SessionError};
+    use std::collections::HashSet;
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    use super::Producer;
+    use async_trait::async_trait;
+    use moq_native_ietf::quic;
+    use moq_transport::{
+        coding::{Decode, DecodeError, Encode, KeyValuePairs, Location, TrackNamespace},
+        data::{FetchHeader, StreamHeader, StreamHeaderType},
+        message::{self, parameter_type, FetchType, GroupOrder, Message, RequestErrorCode},
+        serve::ServeError,
+        session::{Session, SessionError},
+        setup,
+    };
+
+    use crate::{
+        Consumer, Coordinator, CoordinatorContext, CoordinatorError, CoordinatorResult, Locals,
+        NamespaceOrigin, NamespaceRegistration, RemoteManager, SessionContext,
+    };
+
+    use super::{upstream_fetch_params, Producer};
+
+    struct NoopCoordinator;
+
+    #[async_trait]
+    impl Coordinator for NoopCoordinator {
+        async fn register_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+            _context: &CoordinatorContext,
+        ) -> CoordinatorResult<NamespaceRegistration> {
+            Ok(NamespaceRegistration::new(()))
+        }
+
+        async fn unregister_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+        ) -> CoordinatorResult<()> {
+            Ok(())
+        }
+
+        async fn lookup(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+            Err(CoordinatorError::NamespaceNotFound)
+        }
+    }
+
+    struct WireReader {
+        stream: web_transport::RecvStream,
+        buffer: Vec<u8>,
+    }
+
+    impl WireReader {
+        fn new(stream: web_transport::RecvStream) -> Self {
+            Self {
+                stream,
+                buffer: Vec::new(),
+            }
+        }
+
+        async fn decode<T: Decode>(&mut self) -> T {
+            loop {
+                let mut cursor = Cursor::new(self.buffer.as_slice());
+                match T::decode(&mut cursor) {
+                    Ok(value) => {
+                        self.buffer.drain(..cursor.position() as usize);
+                        return value;
+                    }
+                    Err(DecodeError::More(_)) => {
+                        let chunk = self.stream.read(64 * 1024).await.unwrap().unwrap();
+                        self.buffer.extend_from_slice(&chunk);
+                    }
+                    Err(err) => panic!("failed to decode test wire message: {err}"),
+                }
+            }
+        }
+
+        async fn read_to_end(mut self) -> Vec<u8> {
+            while let Some(chunk) = self.stream.read(64 * 1024).await.unwrap() {
+                self.buffer.extend_from_slice(&chunk);
+            }
+            self.buffer
+        }
+    }
+
+    async fn write<T: Encode>(stream: &mut web_transport::SendStream, value: &T) {
+        let mut encoded = Vec::new();
+        value.encode(&mut encoded).unwrap();
+        write_bytes(stream, &encoded).await;
+    }
+
+    async fn write_bytes(stream: &mut web_transport::SendStream, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let written = stream.write(bytes).await.unwrap();
+            assert_ne!(written, 0);
+            bytes = &bytes[written..];
+        }
+    }
+
+    struct ManualPeer {
+        transport: web_transport::Session,
+        control_send: web_transport::SendStream,
+        control_recv: WireReader,
+        server_session: Session,
+        server_publisher: moq_transport::session::Publisher,
+        server_subscriber: moq_transport::session::Subscriber,
+        _client: quic::Client,
+        _server: quic::Server,
+    }
+
+    async fn manual_peer() -> ManualPeer {
+        tokio::time::timeout(Duration::from_secs(5), manual_peer_inner())
+            .await
+            .unwrap()
+    }
+
+    async fn manual_peer_inner() -> ManualPeer {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let certificate = certified.cert.der().clone();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()),
+        );
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], key)
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        let client_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let tls = moq_native_ietf::tls::Config {
+            client: client_tls,
+            server: Some(server_tls),
+            fingerprints: Vec::new(),
+        };
+        let endpoint = quic::Endpoint::new(
+            quic::Config::new("0.0.0.0:0".parse().unwrap(), None, tls).unwrap(),
+        )
+        .unwrap();
+        let quic_client = endpoint.client;
+        let mut server = endpoint.server.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let url = url::Url::parse(&format!("moqt://localhost:{port}/")).unwrap();
+        let (client_connection, server_connection) =
+            tokio::join!(quic_client.connect(&url, Some(addr)), server.accept());
+        let (client_transport, _, client_kind) = client_connection.unwrap();
+        let (server_transport, server_info) = server_connection.unwrap();
+        let manual_setup = async {
+            let (mut send, recv) = client_transport.open_bi().await.unwrap();
+            let mut params = KeyValuePairs::default();
+            params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
+            write(&mut send, &setup::Client { params }).await;
+            let mut recv = WireReader::new(recv);
+            let _: setup::Server = recv.decode().await;
+            (client_transport, send, recv)
+        };
+        let (manual, server_parts) = tokio::try_join!(
+            async { Ok::<_, SessionError>(manual_setup.await) },
+            Session::accept(server_transport, None, server_info.transport),
+        )
+        .unwrap();
+        assert_eq!(client_kind, moq_transport::session::Transport::RawQuic);
+        let (transport, control_send, control_recv) = manual;
+        let (server_session, server_publisher, server_subscriber) = server_parts;
+        ManualPeer {
+            transport,
+            control_send,
+            control_recv,
+            server_session,
+            server_publisher: server_publisher.unwrap(),
+            server_subscriber: server_subscriber.unwrap(),
+            _client: quic_client,
+            _server: server,
+        }
+    }
+
+    fn fetch_request(id: u64, namespace: &TrackNamespace) -> Message {
+        message::Fetch {
+            id,
+            fetch_type: FetchType::Standalone,
+            standalone_fetch: Some(message::StandaloneFetch {
+                track_namespace: namespace.clone(),
+                track_name: "video".into(),
+                start_location: Location::new(0, 0),
+                end_location: Location::new(1, 0),
+            }),
+            joining_fetch: None,
+            params: KeyValuePairs::default(),
+        }
+        .into()
+    }
+
+    #[tokio::test]
+    async fn local_namespace_fetch_passthrough_is_fresh_and_bidirectional() {
+        let mut downstream = manual_peer().await;
+        let mut upstream = manual_peer().await;
+        let coordinator: Arc<dyn Coordinator> = Arc::new(NoopCoordinator);
+        let locals = Locals::new();
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let producer = Producer::new(
+            downstream.server_publisher,
+            locals.clone(),
+            remotes.clone(),
+            coordinator.clone(),
+            SessionContext::public(None),
+        );
+        let consumer = Consumer::new(
+            upstream.server_subscriber,
+            locals.clone(),
+            coordinator,
+            remotes,
+            None,
+            SessionContext::public(None),
+        );
+        let namespace = TrackNamespace::from_utf8_path("test/fetch");
+
+        let scenario = async {
+            write(
+                &mut upstream.control_send,
+                &Message::PublishNamespace(message::PublishNamespace {
+                    id: 0,
+                    track_namespace: namespace.clone(),
+                    params: KeyValuePairs::default(),
+                }),
+            )
+            .await;
+            assert!(matches!(
+                upstream.control_recv.decode::<Message>().await,
+                Message::RequestOk(message::RequestOk { id: 0, .. })
+            ));
+
+            let body = b"opaque fetch body";
+            write(&mut downstream.control_send, &fetch_request(0, &namespace)).await;
+            let Message::Fetch(first) = upstream.control_recv.decode::<Message>().await else {
+                panic!("expected upstream FETCH");
+            };
+            let mut stream = upstream.transport.open_uni().await.unwrap();
+            write(
+                &mut stream,
+                &FetchHeader {
+                    header_type: StreamHeaderType::Fetch,
+                    request_id: first.id,
+                },
+            )
+            .await;
+            write_bytes(&mut stream, body).await;
+            stream.finish().unwrap();
+            write(
+                &mut upstream.control_send,
+                &Message::FetchOk(message::FetchOk {
+                    id: first.id,
+                    end_of_track: true,
+                    end_location: Location::new(1, 0),
+                    params: KeyValuePairs::default(),
+                    track_extensions: Default::default(),
+                }),
+            )
+            .await;
+
+            let stream = downstream.transport.accept_uni().await.unwrap();
+            let mut stream = WireReader::new(stream);
+            let header: StreamHeader = stream.decode().await;
+            assert_eq!(header.fetch_header.unwrap().request_id, 0);
+            assert_eq!(stream.read_to_end().await, body);
+            assert!(matches!(
+                downstream.control_recv.decode::<Message>().await,
+                Message::FetchOk(message::FetchOk {
+                    id: 0,
+                    end_of_track: true,
+                    ..
+                })
+            ));
+
+            let mut upstream_ids = HashSet::from([first.id]);
+            for (id, reason) in [(2, "first miss"), (4, "second miss")] {
+                write(&mut downstream.control_send, &fetch_request(id, &namespace)).await;
+                let Message::Fetch(request) = upstream.control_recv.decode::<Message>().await
+                else {
+                    panic!("expected upstream FETCH");
+                };
+                assert!(upstream_ids.insert(request.id));
+                write(
+                    &mut upstream.control_send,
+                    &Message::RequestError(message::RequestError::new(
+                        request.id,
+                        RequestErrorCode::DoesNotExist,
+                        0,
+                        reason,
+                    )),
+                )
+                .await;
+                let Message::RequestError(error) =
+                    downstream.control_recv.decode::<Message>().await
+                else {
+                    panic!("expected downstream REQUEST_ERROR");
+                };
+                assert_eq!(error.id, id);
+                assert_eq!(error.error_code, RequestErrorCode::DoesNotExist as u64);
+                assert_eq!(error.reason.0, reason);
+            }
+
+            write(&mut downstream.control_send, &fetch_request(6, &namespace)).await;
+            let Message::Fetch(request) = upstream.control_recv.decode::<Message>().await else {
+                panic!("expected cancellable upstream FETCH");
+            };
+            assert!(upstream_ids.insert(request.id));
+            write(
+                &mut downstream.control_send,
+                &Message::FetchCancel(message::FetchCancel { id: 6 }),
+            )
+            .await;
+            assert!(matches!(
+                upstream.control_recv.decode::<Message>().await,
+                Message::FetchCancel(message::FetchCancel { id }) if id == request.id
+            ));
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = scenario => {},
+                result = producer.run() => panic!("producer ended: {result:?}"),
+                result = consumer.run() => panic!("consumer ended: {result:?}"),
+                result = downstream.server_session.run() => panic!("downstream server ended: {result:?}"),
+                result = upstream.server_session.run() => panic!("upstream server ended: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn fetch_params_keep_delivery_policy_without_forwarding_credentials() {
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(parameter_type::AUTHORIZATION_TOKEN, b"private".to_vec());
+        params.set_subscriber_priority(7);
+        params.set_group_order(GroupOrder::Descending);
+        params.set_intvalue(0x40, 9);
+
+        let upstream = upstream_fetch_params(&params).unwrap();
+
+        assert_eq!(upstream.subscriber_priority().unwrap(), Some(7));
+        assert_eq!(
+            upstream.group_order().unwrap(),
+            Some(GroupOrder::Descending)
+        );
+        assert!(upstream.get(parameter_type::AUTHORIZATION_TOKEN).is_none());
+        assert!(upstream.get(0x40).is_none());
+    }
 
     #[test]
     fn expected_serve_shutdown_accepts_wrapped_session_errors() {

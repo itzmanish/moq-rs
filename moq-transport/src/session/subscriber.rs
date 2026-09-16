@@ -624,7 +624,9 @@ impl Subscriber {
         standalone: message::StandaloneFetch,
         params: KeyValuePairs,
     ) -> Result<Fetch, ServeError> {
-        if standalone.start_location > inclusive_end(standalone.end_location) {
+        if standalone.start_location != standalone.end_location
+            && standalone.start_location > inclusive_end(standalone.end_location)
+        {
             return Err(ServeError::Size);
         }
         let id = self
@@ -1058,7 +1060,7 @@ impl Subscriber {
 
     /// Handle REQUEST_ERROR from the publisher (draft-16 §9.8).
     ///
-    /// Routes to an active SUBSCRIBE by request id, otherwise logs and ignores.
+    /// Routes to an active FETCH or SUBSCRIBE by request id, otherwise logs and ignores.
     pub(super) fn recv_request_error(
         &mut self,
         msg: &message::RequestError,
@@ -1740,6 +1742,16 @@ mod tests {
         assert_eq!(first_request.id, first.request.id);
         assert_eq!(second_request.id, second.request.id);
         assert_ne!(first_request.id, second_request.id);
+    }
+
+    #[test]
+    fn outbound_fetch_accepts_empty_equal_location_range() {
+        let mut subscriber = subscriber();
+        let mut request = standalone_fetch("video");
+        request.start_location = crate::coding::Location::new(3, 7);
+        request.end_location = request.start_location;
+
+        assert!(subscriber.fetch(request, KeyValuePairs::default()).is_ok());
     }
 
     #[tokio::test]

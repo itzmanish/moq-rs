@@ -15,7 +15,6 @@ struct FetchState {
     request_error: Option<message::RequestError>,
     closed: Result<(), ServeError>,
     stream_received: bool,
-    cancel_on_drop: bool,
 }
 
 impl Default for FetchState {
@@ -26,7 +25,6 @@ impl Default for FetchState {
             request_error: None,
             closed: Ok(()),
             stream_received: false,
-            cancel_on_drop: true,
         }
     }
 }
@@ -132,7 +130,7 @@ impl Fetch {
 impl Drop for Fetch {
     fn drop(&mut self) {
         let state = self.state.lock();
-        if !(self.stream_done && state.ok.is_some()) && state.cancel_on_drop {
+        if !(self.stream_done && state.ok.is_some()) && state.closed.is_ok() {
             self.subscriber
                 .send_message(message::FetchCancel { id: self.id });
         }
@@ -155,14 +153,12 @@ impl FetchRecv {
         let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
         state.request_error = Some(error.clone());
         state.closed = Err(ServeError::Closed(error.error_code));
-        state.cancel_on_drop = false;
         Ok(())
     }
 
     pub fn recv_timeout(&mut self, err: ServeError) -> Result<(), ServeError> {
         let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
         state.closed = Err(err);
-        state.cancel_on_drop = false;
         Ok(())
     }
 
