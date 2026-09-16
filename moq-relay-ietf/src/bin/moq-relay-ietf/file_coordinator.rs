@@ -21,9 +21,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use moq_relay_ietf::{
-    same_relay_url, scoped_relay_url, Coordinator, CoordinatorContext, CoordinatorError,
-    CoordinatorResult, NamespaceOrigin, NamespaceRegistration, NamespaceSubscription, RelayInfo,
-    SessionInterface, TrackRegistration,
+    Coordinator, CoordinatorContext, CoordinatorError, CoordinatorResult, NamespaceOrigin,
+    NamespaceRegistration, NamespaceSubscription, RelayInfo, SessionInterface, TrackRegistration,
 };
 
 /// Data stored in the shared file
@@ -315,7 +314,7 @@ impl Coordinator for FileCoordinator {
     ) -> CoordinatorResult<NamespaceRegistration> {
         let scope_key = CoordinatorData::scope_key(scope);
         let namespace_key = CoordinatorData::namespace_key(namespace);
-        let relay_url = scoped_relay_url(&self.relay_url, scope)?.to_string();
+        let relay_url = self.relay_url.to_string();
         let file_path = self.file_path.clone();
 
         // Run blocking file I/O in a separate thread
@@ -451,15 +450,15 @@ impl Coordinator for FileCoordinator {
     ) -> CoordinatorResult<NamespaceSubscription> {
         let scope_key = CoordinatorData::scope_key(scope);
         let prefix_key = CoordinatorData::prefix_key(prefix);
-        let caller = scoped_relay_url(&self.relay_url, scope)?;
-        let relay_url = caller.to_string();
+        let relay_url = self.relay_url.to_string();
         let file_path = self.file_path.clone();
 
         // Exclude the caller (this relay) and the inbound source peer so we
         // never return ourselves or the relay the SUBSCRIBE_NAMESPACE arrived
         // from as an upstream pull target. The caller string matches the value
-        // format written by register_namespace.
-        let source = context.source.as_ref().map(|relay| relay.url.clone());
+        // format written by register_namespace (self.relay_url.to_string()).
+        let caller = relay_url.clone();
+        let source = context.source.as_ref().map(|relay| relay.url.to_string());
         let is_public = context.interface == SessionInterface::Public;
 
         let upstream_relays = tokio::task::spawn_blocking({
@@ -494,12 +493,7 @@ impl Coordinator for FileCoordinator {
                             if !namespace_key_has_prefix(namespace_key, &prefix_key) {
                                 continue;
                             }
-                            let hosting_url = Url::parse(hosting_relay)?;
-                            if same_relay_url(&hosting_url, &caller)
-                                || source
-                                    .as_ref()
-                                    .is_some_and(|source| same_relay_url(&hosting_url, source))
-                            {
+                            if hosting_relay == &caller || Some(hosting_relay) == source.as_ref() {
                                 continue;
                             }
                             if seen_relays.insert(hosting_relay.clone()) {
@@ -552,9 +546,9 @@ impl Coordinator for FileCoordinator {
         // Exclude the caller (this relay) and the inbound source peer so a
         // forwarded PUBLISH_NAMESPACE is never sent to ourselves or echoed back
         // to the relay it just arrived from. The caller string matches the key
-        // format written by subscribe_namespace.
-        let caller = scoped_relay_url(&self.relay_url, scope)?;
-        let source = context.source.as_ref().map(|relay| relay.url.clone());
+        // format written by subscribe_namespace (self.relay_url.to_string()).
+        let caller = self.relay_url.to_string();
+        let source = context.source.as_ref().map(|relay| relay.url.to_string());
 
         let subscribers = tokio::task::spawn_blocking(move || -> Result<Vec<RelayInfo>> {
             let file = OpenOptions::new()
@@ -576,12 +570,7 @@ impl Coordinator for FileCoordinator {
                     }
 
                     for relay_url in relays.keys() {
-                        let subscriber_url = Url::parse(relay_url)?;
-                        if same_relay_url(&subscriber_url, &caller)
-                            || source
-                                .as_ref()
-                                .is_some_and(|source| same_relay_url(&subscriber_url, source))
-                        {
+                        if relay_url == &caller || Some(relay_url) == source.as_ref() {
                             continue;
                         }
                         if urls.insert(relay_url.clone()) {
@@ -608,7 +597,7 @@ impl Coordinator for FileCoordinator {
     ) -> CoordinatorResult<TrackRegistration> {
         let scope_key = CoordinatorData::scope_key(scope);
         let track_key = CoordinatorData::track_key(namespace, track);
-        let relay_url = scoped_relay_url(&self.relay_url, scope)?.to_string();
+        let relay_url = self.relay_url.to_string();
         let file_path = self.file_path.clone();
 
         let scope_clone = scope_key.clone();
@@ -794,10 +783,7 @@ mod tests {
             .expect("track lookup should find registration");
 
         assert_eq!(origin.namespace(), &namespace);
-        assert_eq!(
-            origin.url(),
-            Url::parse("https://relay.example.com/scope-a").unwrap()
-        );
+        assert_eq!(origin.url(), relay_url);
         assert!(client.is_none());
 
         let _ = std::fs::remove_file(file);
@@ -831,14 +817,8 @@ mod tests {
             .await
             .expect("second track lookup should find original relay");
 
-        assert_eq!(
-            origin_a.url(),
-            Url::parse("https://relay-a.example.com/scope-a").unwrap()
-        );
-        assert_eq!(
-            origin_b.url(),
-            Url::parse("https://relay-b.example.com/scope-a").unwrap()
-        );
+        assert_eq!(origin_a.url(), relay_a);
+        assert_eq!(origin_b.url(), relay_b);
 
         let _ = std::fs::remove_file(file);
     }
@@ -861,10 +841,7 @@ mod tests {
             .expect("track lookup should fall back to namespace");
 
         assert_eq!(origin.namespace(), &namespace);
-        assert_eq!(
-            origin.url(),
-            Url::parse("https://relay.example.com/scope-a").unwrap()
-        );
+        assert_eq!(origin.url(), relay_url);
         assert!(client.is_none());
 
         let _ = std::fs::remove_file(file);
@@ -926,10 +903,7 @@ mod tests {
             .map(|relay| relay.url.to_string())
             .collect();
 
-        assert_eq!(
-            upstream,
-            vec!["https://origin.example.com/scope-a".to_string()]
-        );
+        assert_eq!(upstream, vec!["https://origin.example.com/".to_string()]);
 
         let _ = std::fs::remove_file(file);
     }
@@ -999,7 +973,7 @@ mod tests {
             .collect();
         assert_eq!(
             scoped_upstream,
-            vec!["https://origin-scoped.example.com/scope-a".to_string()]
+            vec!["https://origin-scoped.example.com/".to_string()]
         );
 
         let _ = std::fs::remove_file(file);
@@ -1035,10 +1009,7 @@ mod tests {
             .expect("subscriber lookup should succeed");
 
         assert_eq!(subscribers.len(), 1);
-        assert_eq!(
-            subscribers[0].url,
-            Url::parse("https://relay.example.com/scope-a").unwrap()
-        );
+        assert_eq!(subscribers[0].url, relay_url);
 
         let no_match = looker
             .lookup_namespace_subscribers(
@@ -1094,10 +1065,7 @@ mod tests {
             .await
             .expect("subscriber lookup should succeed");
         assert_eq!(subscribers.len(), 1);
-        assert_eq!(
-            subscribers[0].url,
-            Url::parse("https://relay.example.com/scope-a").unwrap()
-        );
+        assert_eq!(subscribers[0].url, relay_url);
 
         drop(second);
 
@@ -1163,8 +1131,8 @@ mod tests {
         assert_eq!(
             upstream,
             vec![
-                "https://origin-a.example.com/scope-a".to_string(),
-                "https://origin-b.example.com/scope-a".to_string(),
+                "https://origin-a.example.com/".to_string(),
+                "https://origin-b.example.com/".to_string(),
             ]
         );
 
@@ -1180,10 +1148,7 @@ mod tests {
             .expect("subscriber lookup should succeed");
 
         assert_eq!(subscribers.len(), 1);
-        assert_eq!(
-            subscribers[0].url,
-            Url::parse("https://edge.example.com/scope-a").unwrap()
-        );
+        assert_eq!(subscribers[0].url, edge_url);
 
         let _ = std::fs::remove_file(file);
     }
@@ -1243,7 +1208,7 @@ mod tests {
 
         assert_eq!(
             upstream,
-            vec!["https://origin-two.example.com/scope-a".to_string()]
+            vec!["https://origin-two.example.com/".to_string()]
         );
 
         let _ = std::fs::remove_file(file);
@@ -1424,10 +1389,7 @@ mod tests {
             .await
             .expect("subscriber lookup should succeed");
         assert_eq!(subscribers.len(), 1);
-        assert_eq!(
-            subscribers[0].url,
-            Url::parse("https://edge.example.com/scope-a").unwrap()
-        );
+        assert_eq!(subscribers[0].url, edge_url);
 
         // When the PUBLISH_NAMESPACE arrived *from* the edge relay, it must be
         // excluded so it is not echoed back.

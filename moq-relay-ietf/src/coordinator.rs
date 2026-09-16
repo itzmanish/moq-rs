@@ -42,34 +42,6 @@ impl From<std::io::Error> for CoordinatorError {
 
 pub type CoordinatorResult<T> = std::result::Result<T, CoordinatorError>;
 
-/// Apply a path-shaped scope to a relay's advertised connection URL.
-pub fn scoped_relay_url(relay_url: &Url, scope: Option<&str>) -> CoordinatorResult<Url> {
-    let Some(scope) = scope else {
-        return Ok(relay_url.clone());
-    };
-    let path = if scope.starts_with('/') {
-        scope.to_string()
-    } else {
-        format!("/{scope}")
-    };
-    let path = moq_transport::session::Session::normalize_connection_path(&path)
-        .map_err(|err| CoordinatorError::Other(anyhow::anyhow!(err)))?
-        .ok_or_else(|| CoordinatorError::Other(anyhow::anyhow!("scope path is empty")))?;
-    let mut scoped = relay_url.clone();
-    scoped.set_path(&path);
-    Ok(scoped)
-}
-
-/// Compare relay URL identities without treating session paths as distinct relays.
-pub fn same_relay_url(left: &Url, right: &Url) -> bool {
-    fn port(url: &Url) -> Option<u16> {
-        url.port_or_known_default()
-            .or_else(|| (url.scheme() == "moqt").then_some(443))
-    }
-
-    left.host_str() == right.host_str() && port(left) == port(right)
-}
-
 /// Handle returned when a namespace is registered with the coordinator.
 ///
 /// Dropping this handle automatically unregisters the namespace.
@@ -583,9 +555,6 @@ pub trait Coordinator: Send + Sync {
     ///
     /// - `Ok(NamespaceOrigin, Option<quic::Client>)` - Namespace origin and optional client if available
     /// - `Err` - Namespace not found anywhere
-    ///
-    /// The returned URL must be complete and dialable, and its path must establish
-    /// a session that resolves to the requested scope.
     async fn lookup(
         &self,
         scope: Option<&str>,
@@ -962,17 +931,6 @@ mod tests {
 
     fn prefix(path: &str) -> TrackNamespacePrefix {
         TrackNamespacePrefix::from_utf8_path(path)
-    }
-
-    #[test]
-    fn scoped_relay_url_uses_scope_as_connection_path() {
-        let relay = Url::parse("moqt://relay.example/base").unwrap();
-
-        assert_eq!(
-            scoped_relay_url(&relay, Some("scope-a")).unwrap(),
-            Url::parse("moqt://relay.example/scope-a").unwrap()
-        );
-        assert_eq!(scoped_relay_url(&relay, None).unwrap(), relay);
     }
 
     /// Returns true if `namespace` starts with all the fields in `prefix`.

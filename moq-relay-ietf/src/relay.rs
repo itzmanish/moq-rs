@@ -49,7 +49,7 @@ pub struct RelayConfig {
     /// Forward all PUBLISH_NAMESPACE messages to the (optional) upstream URL.
     pub announce: Option<Url>,
 
-    /// Our hostname which we advertise to other origins and use to reject self-routes.
+    /// Our hostname which we advertise to other origins.
     /// We use QUIC, so the certificate must be valid for this address.
     pub node: Option<Url>,
 
@@ -64,8 +64,7 @@ pub struct RelayConfig {
     /// once per accepted connection with the peer's socket address and
     /// connection path.
     ///
-    /// When `None`, every inbound connection is treated as a public client and
-    /// one-hop remote FETCH remains disabled.
+    /// When `None`, every inbound connection is treated as a public client.
     /// Outbound connections the relay dials itself (`--announce`,
     /// [`RemoteManager`]) are always tagged internal and bypass this.
     pub connection_tagger: Option<Arc<dyn ConnectionTagger>>,
@@ -151,24 +150,14 @@ impl Relay {
             .iter()
             .map(|endpoint| endpoint.client.clone())
             .collect::<Vec<_>>();
-        let local_addrs = remote_clients
-            .iter()
-            .filter_map(|client| client.local_addr().ok())
-            .filter(|addr| !addr.ip().is_unspecified())
-            .collect::<Vec<_>>();
 
         // Create remote manager - uses coordinator for namespace lookups
-        let mut remotes = RemoteManager::new_with_session_config(
+        let remotes = RemoteManager::new_with_session_config(
             config.coordinator.clone(),
             remote_clients,
             config.session,
         )
         .with_cache_idle_timeout(cache_idle_timeout);
-        if config.connection_tagger.is_some() {
-            if let Some(node) = config.node.clone() {
-                remotes = remotes.with_local_url(node).with_local_addrs(local_addrs);
-            }
-        }
         let (upstream_namespaces, upstream_namespaces_runner) =
             UpstreamNamespaces::new(locals.clone(), remotes.clone(), config.coordinator.clone());
 

@@ -37,7 +37,7 @@ const MAX_TERMINAL_FETCHES: usize = 1024;
 #[derive(Default)]
 struct FetchRegistry {
     active: HashMap<u64, FetchRecv>,
-    terminal: VecDeque<u64>,
+    terminal: VecDeque<(u64, bool)>,
 }
 
 impl FetchRegistry {
@@ -47,21 +47,21 @@ impl FetchRegistry {
 
     fn remove(&mut self, id: u64) -> Option<FetchRecv> {
         let fetch = self.active.remove(&id)?;
-        if !fetch.stream_received() {
-            self.terminal.push_back(id);
-            if self.terminal.len() > MAX_TERMINAL_FETCHES {
-                self.terminal.pop_front();
-            }
+        self.terminal.push_back((id, fetch.stream_received()));
+        if self.terminal.len() > MAX_TERMINAL_FETCHES {
+            self.terminal.pop_front();
         }
         Some(fetch)
     }
 
-    fn take_terminal(&mut self, id: u64) -> bool {
-        let Some(index) = self.terminal.iter().position(|terminal| *terminal == id) else {
-            return false;
-        };
-        self.terminal.remove(index);
-        true
+    fn receive_terminal_stream(&mut self, id: u64) -> Option<bool> {
+        let terminal = self
+            .terminal
+            .iter_mut()
+            .find(|(terminal_id, _)| *terminal_id == id)?;
+        let stream_received = terminal.1;
+        terminal.1 = true;
+        Some(stream_received)
     }
 }
 
@@ -675,7 +675,7 @@ impl Subscriber {
         }
     }
 
-    pub fn try_fetch(
+    fn try_fetch(
         &mut self,
         standalone: message::StandaloneFetch,
         params: KeyValuePairs,
@@ -1325,10 +1325,18 @@ impl Subscriber {
                 })?;
                 return Ok(());
             }
-            if fetches.take_terminal(fetch.request_id) {
-                drop(fetches);
-                reader.stop(crate::data::DataStreamResetCode::Cancelled.into());
-                return Ok(());
+            match fetches.receive_terminal_stream(fetch.request_id) {
+                Some(false) => {
+                    drop(fetches);
+                    reader.stop(crate::data::DataStreamResetCode::Cancelled.into());
+                    return Ok(());
+                }
+                Some(true) => {
+                    return Err(SessionError::ProtocolViolation(
+                        super::DUPLICATE_FETCH_STREAM_REASON.to_string(),
+                    ));
+                }
+                None => {}
             }
             return Err(SessionError::Serve(ServeError::not_found_ctx(format!(
                 "fetch request {} not found",
@@ -1886,12 +1894,14 @@ mod tests {
             panic!("expected FETCH_CANCEL");
         };
         assert_eq!(cancel.id, request.id);
-        let fetches = subscriber.fetches.lock().unwrap();
+        let mut fetches = subscriber.fetches.lock().unwrap();
         assert!(fetches.active.is_empty());
         assert_eq!(
             fetches.terminal.iter().copied().collect::<Vec<_>>(),
-            [request.id]
+            [(request.id, false)]
         );
+        assert_eq!(fetches.receive_terminal_stream(request.id), Some(false));
+        assert_eq!(fetches.receive_terminal_stream(request.id), Some(true));
         drop(fetches);
         assert!(outgoing.close().is_empty());
     }

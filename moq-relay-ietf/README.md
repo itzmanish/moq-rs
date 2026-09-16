@@ -4,8 +4,6 @@ A server that connects publishing clients to subscribing clients.
 SUBSCRIBE requests are deduplicated and cached, so that a single publisher can serve many subscribers.
 Standalone FETCH requests always create a fresh upstream request and are never cached or deduplicated.
 
-Remote FETCH is limited to one relay hop and requires both a configured node URL and an inbound connection tagger. Coordinator origin URLs must include the connection path that resolves to the requested scope.
-
 ## Usage
 
 The publisher must choose a unique name for their broadcast, sent as the WebTransport path when connecting to the server.

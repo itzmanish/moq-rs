@@ -29,12 +29,12 @@ This repository provides:
 - PUBLISH / PUBLISH_OK / PUBLISH_DONE
 - SUBSCRIBE
 - SUBSCRIBE_NAMESPACE
-- Standalone FETCH passthrough for local and one-hop remote PUBLISH_NAMESPACE origins
+- Standalone FETCH passthrough for local and remote PUBLISH_NAMESPACE origins
 - WebTransport and raw QUIC transport layers
 - Both stream ("subgroup") and datagram delivery modes
 
 **Not Supported:**
-- Joining FETCH, exact PUBLISH origins, cached FETCH responses, and multi-hop relay chaining
+- Joining FETCH, exact PUBLISH origins, and cached FETCH responses
 - GOAWAY
 
 ## Interoperability

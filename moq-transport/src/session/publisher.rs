@@ -655,6 +655,7 @@ impl Publisher {
 
     fn recv_fetch(&mut self, msg: message::Fetch) -> Result<(), SessionError> {
         let id = msg.id;
+        validate_fetch_params(&msg.params)?;
         if msg.fetch_type != message::FetchType::Standalone {
             self.send_not_supported(msg.id, "joining fetch");
             return Ok(());
@@ -664,7 +665,6 @@ impl Publisher {
             .standalone_fetch
             .as_ref()
             .ok_or(SessionError::Internal)?;
-        validate_fetch_params(&msg.params)?;
         if standalone.start_location != standalone.end_location
             && standalone.start_location
                 > super::fetch_requested::inclusive_end(standalone.end_location)

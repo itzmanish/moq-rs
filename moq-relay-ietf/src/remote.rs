@@ -64,11 +64,6 @@ pub struct RemoteManager {
     /// How long an unwatched cross-relay cache entry is retained before its
     /// upstream subscription is released. Zero disables eviction.
     cache_idle_timeout: Duration,
-
-    /// This relay's public identity. Remote FETCH is disabled when absent.
-    local_url: Option<Url>,
-    /// Concrete local listener addresses used for direct-address self checks.
-    local_addrs: Vec<SocketAddr>,
 }
 
 #[cfg(test)]
@@ -76,11 +71,6 @@ mod tests {
     use super::*;
 
     struct NoopCoordinator;
-
-    struct SelfCoordinator {
-        url: Url,
-        addr: Option<SocketAddr>,
-    }
 
     #[async_trait::async_trait]
     impl Coordinator for NoopCoordinator {
@@ -107,37 +97,6 @@ mod tests {
             _namespace: &TrackNamespace,
         ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
             Err(crate::CoordinatorError::NamespaceNotFound)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Coordinator for SelfCoordinator {
-        async fn register_namespace(
-            &self,
-            _scope: Option<&str>,
-            _namespace: &TrackNamespace,
-            _context: &crate::CoordinatorContext,
-        ) -> crate::CoordinatorResult<crate::NamespaceRegistration> {
-            Ok(crate::NamespaceRegistration::new(()))
-        }
-
-        async fn unregister_namespace(
-            &self,
-            _scope: Option<&str>,
-            _namespace: &TrackNamespace,
-        ) -> crate::CoordinatorResult<()> {
-            Ok(())
-        }
-
-        async fn lookup(
-            &self,
-            _scope: Option<&str>,
-            namespace: &TrackNamespace,
-        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
-            Ok((
-                crate::NamespaceOrigin::new(namespace.clone(), self.url.clone(), self.addr),
-                None,
-            ))
         }
     }
 
@@ -225,64 +184,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_fetch_requires_local_identity() {
+    async fn remote_fetch_returns_none_when_coordinator_has_no_origin() {
         let manager = RemoteManager::new(Arc::new(NoopCoordinator), Vec::new());
 
         assert!(manager
             .fetch(None, fetch_request(), KeyValuePairs::default())
             .await
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn remote_fetch_returns_none_when_coordinator_has_no_origin() {
-        let manager = RemoteManager::new(Arc::new(NoopCoordinator), Vec::new())
-            .with_local_url(Url::parse("moqt://relay.example/").unwrap());
-
-        assert!(manager
-            .fetch(None, fetch_request(), KeyValuePairs::default())
-            .await
             .unwrap()
             .is_none());
-    }
-
-    #[tokio::test]
-    async fn remote_fetch_rejects_self_origin_before_connecting() {
-        let local = Url::parse("https://relay.example/internal").unwrap();
-        let manager = RemoteManager::new(
-            Arc::new(SelfCoordinator {
-                url: Url::parse("moqt://relay.example/other-scope").unwrap(),
-                addr: None,
-            }),
-            Vec::new(),
-        )
-        .with_local_url(local);
-
-        assert!(manager
-            .fetch(None, fetch_request(), KeyValuePairs::default())
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn direct_addresses_disambiguate_shared_relay_urls() {
-        let url = Url::parse("moqt://relay.example/scope-a").unwrap();
-        let local_addr = "192.0.2.1:443".parse().unwrap();
-        let peer_addr = "192.0.2.2:443".parse().unwrap();
-        let peer = crate::NamespaceOrigin::new(
-            fetch_request().track_namespace,
-            url.clone(),
-            Some(peer_addr),
-        );
-        let local_alias = crate::NamespaceOrigin::new(
-            TrackNamespace::from_utf8_path("test/fetch"),
-            Url::parse("moqt://relay-alias.example/scope-a").unwrap(),
-            Some(local_addr),
-        );
-
-        assert!(!same_endpoint(&peer, &url, &[local_addr]));
-        assert!(same_endpoint(&local_alias, &url, &[local_addr]));
     }
 
     fn cached_track() -> (TrackSlot, TrackInterest) {
@@ -393,21 +302,7 @@ impl RemoteManager {
             session_config,
             remotes: Arc::new(Mutex::new(HashMap::new())),
             cache_idle_timeout: DEFAULT_CACHE_IDLE_TIMEOUT,
-            local_url: None,
-            local_addrs: Vec::new(),
         }
-    }
-
-    /// Enable one-hop remote FETCH and reject coordinator self-routes.
-    pub fn with_local_url(mut self, local_url: Url) -> Self {
-        self.local_url = Some(local_url);
-        self
-    }
-
-    /// Add concrete listener addresses for direct-address self-route checks.
-    pub fn with_local_addrs(mut self, local_addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
-        self.local_addrs.extend(local_addrs);
-        self
     }
 
     /// Override how long an unwatched cross-relay cache entry is retained before
@@ -484,10 +379,6 @@ impl RemoteManager {
         request: StandaloneFetch,
         params: KeyValuePairs,
     ) -> anyhow::Result<Option<Fetch>> {
-        let local_url = self
-            .local_url
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("remote FETCH is not configured"))?;
         let (origin, client) = match self
             .coordinator
             .lookup(scope, &request.track_namespace)
@@ -497,10 +388,6 @@ impl RemoteManager {
             Err(CoordinatorError::NamespaceNotFound) => return Ok(None),
             Err(err) => return Err(err.into()),
         };
-        if same_endpoint(&origin, local_url, &self.local_addrs) {
-            return Ok(None);
-        }
-
         let cache_key = (origin.url(), origin.addr());
         let remote = self.get_or_connect(cache_key, client.as_ref()).await?;
         Ok(Some(remote.fetch(request, params).await?))
@@ -700,21 +587,6 @@ impl RemoteManager {
             }
         }
     }
-}
-
-fn same_endpoint(
-    origin: &crate::NamespaceOrigin,
-    local_url: &Url,
-    local_addrs: &[SocketAddr],
-) -> bool {
-    if let Some(addr) = origin.addr() {
-        if !local_addrs.is_empty() {
-            return local_addrs.contains(&addr);
-        }
-    }
-
-    let origin_url = origin.url();
-    crate::same_relay_url(&origin_url, local_url)
 }
 
 async fn remove_empty_remote_slot(

@@ -12,7 +12,7 @@ use moq_transport::{
     message::{RequestErrorCode, SubscribeOptions},
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
     session::{
-        Fetch, FetchRequested, Publisher, SessionError, Subscribed, SubscribedNamespace,
+        FetchRequested, Publisher, SessionError, Subscribed, SubscribedNamespace,
         TrackStatusRequested,
     },
 };
@@ -21,8 +21,8 @@ use tokio::sync::broadcast;
 use crate::{
     metrics::{GaugeGuard, TimingGuard},
     upstream_namespaces::UpstreamNamespaces,
-    Coordinator, Locals, NamespaceChange, RemoteManager, SessionContext, SessionInterface,
-    TrackChange, UpstreamReady,
+    Coordinator, Locals, NamespaceChange, RemoteManager, SessionContext, TrackChange,
+    UpstreamReady,
 };
 
 /// Producer of tracks to a remote Subscriber
@@ -50,12 +50,6 @@ enum UpstreamWait {
 
     /// The downstream subscriber went away before it was established.
     DownstreamLeft(ServeError),
-}
-
-enum RemoteFetchOutcome {
-    Closed,
-    Timeout,
-    Complete(Box<anyhow::Result<Option<Fetch>>>),
 }
 
 impl Producer {
@@ -193,48 +187,36 @@ impl Producer {
         if fetch.closed().now_or_never().is_some() {
             return Ok(());
         }
-        let upstream = if let Some(mut source) = self
-            .locals
-            .fetch_source(self.context.scope(), &standalone.track_namespace)
-        {
-            match source.fetch(standalone.clone(), params) {
-                Ok(upstream) => upstream,
-                Err(err) => {
-                    fetch.reject(
-                        RequestErrorCode::InternalError,
-                        "failed to open upstream FETCH",
-                    )?;
-                    return Err(err).context("failed to open upstream FETCH");
-                }
+        let open = async {
+            if let Some(mut source) = self
+                .locals
+                .fetch_source(self.context.scope(), &standalone.track_namespace)
+            {
+                Ok(Some(source.fetch_wait(standalone, params).await?))
+            } else {
+                self.remotes
+                    .fetch(self.context.scope(), standalone, params)
+                    .await
             }
-        } else {
-            if self.context.interface == SessionInterface::Internal {
-                fetch.reject(RequestErrorCode::DoesNotExist, "track not found")?;
+        };
+        let upstream = tokio::select! {
+            biased;
+            _ = fetch.closed() => return Ok(()),
+            _ = tokio::time::sleep_until(deadline) => {
+                fetch.reject(RequestErrorCode::Timeout, "FETCH routing timed out")?;
                 return Ok(());
             }
-
-            let remote = match self
-                .route_remote_fetch(&fetch, deadline, standalone.clone(), params)
-                .await
-            {
-                RemoteFetchOutcome::Closed => return Ok(()),
-                RemoteFetchOutcome::Timeout => {
-                    fetch.reject(RequestErrorCode::Timeout, "FETCH routing timed out")?;
+            result = open => match result {
+                Ok(Some(upstream)) => upstream,
+                Ok(None) => {
+                    fetch.reject(RequestErrorCode::DoesNotExist, "track not found")?;
                     return Ok(());
                 }
-                RemoteFetchOutcome::Complete(result) => match *result {
-                    Ok(Some(remote)) => remote,
-                    Ok(None) => {
-                        fetch.reject(RequestErrorCode::DoesNotExist, "track not found")?;
-                        return Ok(());
-                    }
-                    Err(err) => {
-                        fetch.reject(RequestErrorCode::InternalError, "failed to route FETCH")?;
-                        return Err(err).context("failed to route upstream FETCH");
-                    }
-                },
-            };
-            remote
+                Err(err) => {
+                    fetch.reject(RequestErrorCode::InternalError, "failed to open upstream FETCH")?;
+                    return Err(err).context("failed to open upstream FETCH");
+                }
+            },
         };
         fetch
             .proxy(
@@ -243,23 +225,6 @@ impl Producer {
             )
             .await?;
         Ok(())
-    }
-
-    async fn route_remote_fetch(
-        &self,
-        fetch: &FetchRequested,
-        deadline: tokio::time::Instant,
-        request: moq_transport::message::StandaloneFetch,
-        params: KeyValuePairs,
-    ) -> RemoteFetchOutcome {
-        let route = self.remotes.fetch(self.context.scope(), request, params);
-        tokio::pin!(route);
-        tokio::select! {
-            biased;
-            _ = fetch.closed() => RemoteFetchOutcome::Closed,
-            _ = tokio::time::sleep_until(deadline) => RemoteFetchOutcome::Timeout,
-            result = &mut route => RemoteFetchOutcome::Complete(Box::new(result)),
-        }
     }
 
     /// Serve a subscribe request.
@@ -969,7 +934,7 @@ mod tests {
         let server = endpoint.server.unwrap();
         let port = server.local_addr().unwrap().port();
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let url = url::Url::parse(&format!("moqt://localhost:{port}/")).unwrap();
+        let url = url::Url::parse("moqt://localhost/").unwrap();
         (quic_client, server, url, addr)
     }
 
@@ -1213,7 +1178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_relay_fetch_is_one_hop_fresh_and_cache_free() {
+    async fn two_relay_fetch_is_fresh_and_cache_free() {
         let mut downstream = manual_peer().await;
         let mut publisher = manual_peer().await;
         let (route_client, mut origin_server, origin_url, origin_addr) = test_endpoint();
@@ -1227,10 +1192,8 @@ mod tests {
         let origin_coordinator: Arc<dyn Coordinator> = Arc::new(origin_coordinator);
         let edge_locals = Locals::new();
         let origin_locals = Locals::new();
-        let edge_remotes = RemoteManager::new(edge_coordinator.clone(), Vec::new())
-            .with_local_url(url::Url::parse("moqt://edge.example/internal").unwrap());
-        let origin_remotes = RemoteManager::new(origin_coordinator.clone(), Vec::new())
-            .with_local_url(origin_url.clone());
+        let edge_remotes = RemoteManager::new(edge_coordinator.clone(), Vec::new());
+        let origin_remotes = RemoteManager::new(origin_coordinator.clone(), Vec::new());
         let edge = Producer::new(
             downstream.server_publisher,
             edge_locals,
@@ -1423,7 +1386,7 @@ mod tests {
             };
             assert_eq!(error.id, 10);
             assert_eq!(error.error_code, RequestErrorCode::DoesNotExist as u64);
-            assert_eq!(origin_lookups.load(Ordering::Relaxed), 0);
+            assert_eq!(origin_lookups.load(Ordering::Relaxed), 1);
             assert_eq!(edge_lookups.load(Ordering::Relaxed), 6);
             assert_eq!(accepts.load(Ordering::Relaxed), 1);
             assert!(edge_scopes
