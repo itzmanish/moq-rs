@@ -139,6 +139,7 @@ const MAX_CONCURRENT_SUBSCRIBE_NAMESPACE_STREAMS: usize = 256;
 /// bidirectional stream before treating the peer as misbehaving. Prevents idle or
 /// malicious streams from occupying an accept slot indefinitely.
 const SUBSCRIBE_NAMESPACE_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const DUPLICATE_FETCH_STREAM_REASON: &str = "received multiple streams for one FETCH";
 
 /// Session-level protocol limits advertised during setup.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1482,16 +1483,26 @@ impl Session {
                     });
                 },
                 Some((session_id, result)) = tasks.next(), if !tasks.is_empty() => {
-                    if let Err(err) = result {
-                        if err.is_stream_error() {
-                            tracing::warn!(session_id = %session_id, "failed to serve stream: {}", err);
-                        } else {
-                            return Err(err);
-                        }
-                    }
+                    Self::handle_stream_result(&session_id, result)?;
                 },
             };
         }
+    }
+
+    fn handle_stream_result(
+        session_id: &SessionId,
+        result: Result<(), SessionError>,
+    ) -> Result<(), SessionError> {
+        if let Err(err) = result {
+            if matches!(
+                &err,
+                SessionError::ProtocolViolation(reason) if reason == DUPLICATE_FETCH_STREAM_REASON
+            ) {
+                return Err(err);
+            }
+            tracing::warn!(session_id = %session_id, "failed to serve stream: {}", err);
+        }
+        Ok(())
     }
 
     /// Receives QUIC datagrams and processes them using the Subscriber logic
@@ -1544,6 +1555,37 @@ mod tests {
 
         let output = capture.0.lock().unwrap().clone();
         String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn benign_stream_not_found_does_not_stop_session_loop() {
+        let session_id = SessionId::generate();
+        assert!(Session::handle_stream_result(
+            &session_id,
+            Err(SessionError::Serve(ServeError::NotFound))
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn only_duplicate_fetch_stream_violation_stops_session_loop() {
+        let session_id = SessionId::generate();
+        assert!(Session::handle_stream_result(
+            &session_id,
+            Err(SessionError::unimplemented(
+                "non-SUBGROUP stream types"
+            ))
+        )
+        .is_ok());
+        assert!(matches!(
+            Session::handle_stream_result(
+                &session_id,
+                Err(SessionError::ProtocolViolation(
+                    DUPLICATE_FETCH_STREAM_REASON.to_string()
+                ))
+            ),
+            Err(SessionError::ProtocolViolation(_))
+        ));
     }
 
     // ========================================================================

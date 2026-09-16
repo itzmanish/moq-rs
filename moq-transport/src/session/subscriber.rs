@@ -1317,7 +1317,7 @@ impl Subscriber {
                 recv.recv_stream(reader).map_err(|err| {
                     if err == ServeError::Duplicate {
                         SessionError::ProtocolViolation(
-                            "received multiple streams for one FETCH".to_string(),
+                            super::DUPLICATE_FETCH_STREAM_REASON.to_string(),
                         )
                     } else {
                         err.into()
