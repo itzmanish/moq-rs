@@ -33,6 +33,7 @@ struct RequestIdInner {
     session_id: SessionId,
     send: Mutex<SendState>,
     recv: Mutex<RecvState>,
+    peer_max: tokio::sync::watch::Sender<Option<u64>>,
 }
 
 #[derive(Debug)]
@@ -53,6 +54,7 @@ struct RecvState {
     /// (`our_max - low_water`, i.e. the peer's outstanding request lookahead).
     received_above_low_water: HashSet<u64>,
     our_max: u64,
+    window: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -109,6 +111,7 @@ impl RequestId {
         our_max: u64,
         peer_first_id: u64,
     ) -> Self {
+        let (peer_max_tx, _) = tokio::sync::watch::channel(Some(peer_max));
         Self {
             inner: Arc::new(RequestIdInner {
                 session_id,
@@ -122,7 +125,9 @@ impl RequestId {
                     low_water: peer_first_id,
                     received_above_low_water: HashSet::new(),
                     our_max,
+                    window: our_max,
                 }),
+                peer_max: peer_max_tx,
             }),
         }
     }
@@ -169,7 +174,33 @@ impl RequestId {
 
         send.peer_max = msg.request_id;
         send.blocked_sent_for = None;
+        self.inner.peer_max.send_replace(Some(msg.request_id));
         Ok(())
+    }
+
+    pub async fn wait_for_send_credit(&self) -> Result<(), SessionError> {
+        let current = self
+            .inner
+            .send
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .peer_max;
+        let mut peer_max = self.inner.peer_max.subscribe();
+        loop {
+            match *peer_max.borrow_and_update() {
+                Some(max) if max > current => return Ok(()),
+                Some(_) => {}
+                None => return Err(SessionError::Internal),
+            }
+            peer_max
+                .changed()
+                .await
+                .map_err(|_| SessionError::Internal)?;
+        }
+    }
+
+    pub fn close(&self) {
+        self.inner.peer_max.send_replace(None);
     }
 
     /// Validate an incoming new request ID from the peer.
@@ -203,20 +234,26 @@ impl RequestId {
 
     /// Handle REQUESTS_BLOCKED from the peer.
     ///
-    /// If the peer has consumed our current advertised maximum and reports that
-    /// same maximum as blocked, we currently ignore this. In the future, we may
-    /// advertise new incremented MAX_REQUEST_ID.
-    pub fn handle_requests_blocked(&self, msg: &RequestsBlocked) -> Result<(), SessionError> {
-        let recv = self.inner.recv.lock().map_err(|_| SessionError::Internal)?;
-        tracing::warn!(
-            session_id = %self.inner.session_id,
-            "got requests blocked, peer max: {}, configured limit: {}, limit hit: {}, ignoring it",
-            msg.max_request_id,
-            recv.our_max,
-            msg.max_request_id == recv.our_max
-        );
+    /// Replenish the peer's request-ID window when it reaches our advertised limit.
+    pub fn handle_requests_blocked(
+        &self,
+        msg: &RequestsBlocked,
+    ) -> Result<Option<MaxRequestId>, SessionError> {
+        let mut recv = self.inner.recv.lock().map_err(|_| SessionError::Internal)?;
+        if msg.max_request_id > recv.our_max {
+            return Err(SessionError::ProtocolViolation(
+                "REQUESTS_BLOCKED exceeds advertised MAX_REQUEST_ID".to_string(),
+            ));
+        }
+        if msg.max_request_id < recv.our_max || recv.window == 0 {
+            return Ok(None);
+        }
 
-        Ok(())
+        let Some(request_id) = recv.our_max.checked_add(recv.window) else {
+            return Ok(None);
+        };
+        recv.our_max = request_id;
+        Ok(Some(MaxRequestId { request_id }))
     }
 }
 
@@ -320,6 +357,32 @@ mod tests {
     }
 
     #[test]
+    fn requests_blocked_replenishes_receive_window() {
+        let ids = server_ids(10, 4);
+        ids.validate_incoming(0).unwrap();
+        ids.validate_incoming(2).unwrap();
+
+        let update = ids
+            .handle_requests_blocked(&RequestsBlocked { max_request_id: 4 })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(update.request_id, 8);
+        ids.validate_incoming(4).unwrap();
+        ids.validate_incoming(6).unwrap();
+    }
+
+    #[test]
+    fn requests_blocked_above_advertised_limit_is_rejected() {
+        let ids = server_ids(10, 4);
+
+        assert!(matches!(
+            ids.handle_requests_blocked(&RequestsBlocked { max_request_id: 6 }),
+            Err(SessionError::ProtocolViolation(_))
+        ));
+    }
+
+    #[test]
     fn max_request_id_must_increase() {
         let ids = client_ids(10, 10);
         assert!(matches!(
@@ -346,6 +409,17 @@ mod tests {
             .unwrap();
         assert_eq!(ids.allocate().unwrap(), RequestIdAllocation::Allocated(2));
         assert_eq!(ids.allocate().unwrap(), RequestIdAllocation::Allocated(4));
+    }
+
+    #[tokio::test]
+    async fn waiting_for_request_credit_exits_when_session_closes() {
+        let ids = client_ids(2, 10);
+        ids.close();
+
+        assert!(matches!(
+            ids.wait_for_send_credit().await,
+            Err(SessionError::Internal)
+        ));
     }
 
     #[test]

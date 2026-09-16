@@ -149,6 +149,10 @@ impl Drop for Fetch {
 }
 
 impl FetchRecv {
+    pub fn stream_received(&self) -> bool {
+        self.state.lock().stream_received
+    }
+
     pub fn recv_ok(&mut self, ok: &FetchOk) -> Result<(), ServeError> {
         let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
         if state.ok.is_some() {

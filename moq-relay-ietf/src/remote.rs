@@ -67,6 +67,8 @@ pub struct RemoteManager {
 
     /// This relay's public identity. Remote FETCH is disabled when absent.
     local_url: Option<Url>,
+    /// Concrete local listener addresses used for direct-address self checks.
+    local_addrs: Vec<SocketAddr>,
 }
 
 #[cfg(test)]
@@ -77,6 +79,7 @@ mod tests {
 
     struct SelfCoordinator {
         url: Url,
+        addr: Option<SocketAddr>,
     }
 
     #[async_trait::async_trait]
@@ -132,7 +135,7 @@ mod tests {
             namespace: &TrackNamespace,
         ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
             Ok((
-                crate::NamespaceOrigin::new(namespace.clone(), self.url.clone(), None),
+                crate::NamespaceOrigin::new(namespace.clone(), self.url.clone(), self.addr),
                 None,
             ))
         }
@@ -249,6 +252,7 @@ mod tests {
         let manager = RemoteManager::new(
             Arc::new(SelfCoordinator {
                 url: Url::parse("moqt://relay.example/other-scope").unwrap(),
+                addr: None,
             }),
             Vec::new(),
         )
@@ -259,6 +263,26 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn direct_addresses_disambiguate_shared_relay_urls() {
+        let url = Url::parse("moqt://relay.example/scope-a").unwrap();
+        let local_addr = "192.0.2.1:443".parse().unwrap();
+        let peer_addr = "192.0.2.2:443".parse().unwrap();
+        let peer = crate::NamespaceOrigin::new(
+            fetch_request().track_namespace,
+            url.clone(),
+            Some(peer_addr),
+        );
+        let local_alias = crate::NamespaceOrigin::new(
+            TrackNamespace::from_utf8_path("test/fetch"),
+            Url::parse("moqt://relay-alias.example/scope-a").unwrap(),
+            Some(local_addr),
+        );
+
+        assert!(!same_endpoint(&peer, &url, &[local_addr]));
+        assert!(same_endpoint(&local_alias, &url, &[local_addr]));
     }
 
     fn cached_track() -> (TrackSlot, TrackInterest) {
@@ -370,12 +394,19 @@ impl RemoteManager {
             remotes: Arc::new(Mutex::new(HashMap::new())),
             cache_idle_timeout: DEFAULT_CACHE_IDLE_TIMEOUT,
             local_url: None,
+            local_addrs: Vec::new(),
         }
     }
 
     /// Enable one-hop remote FETCH and reject coordinator self-routes.
     pub fn with_local_url(mut self, local_url: Url) -> Self {
         self.local_url = Some(local_url);
+        self
+    }
+
+    /// Add concrete listener addresses for direct-address self-route checks.
+    pub fn with_local_addrs(mut self, local_addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.local_addrs.extend(local_addrs);
         self
     }
 
@@ -466,13 +497,13 @@ impl RemoteManager {
             Err(CoordinatorError::NamespaceNotFound) => return Ok(None),
             Err(err) => return Err(err.into()),
         };
-        if same_endpoint(&origin.url(), local_url) {
+        if same_endpoint(&origin, local_url, &self.local_addrs) {
             return Ok(None);
         }
 
         let cache_key = (origin.url(), origin.addr());
         let remote = self.get_or_connect(cache_key, client.as_ref()).await?;
-        Ok(Some(remote.fetch(request, params)?))
+        Ok(Some(remote.fetch(request, params).await?))
     }
 
     /// Forward a `SUBSCRIBE_NAMESPACE` to a specific relay peer.
@@ -671,13 +702,19 @@ impl RemoteManager {
     }
 }
 
-fn same_endpoint(left: &Url, right: &Url) -> bool {
-    fn port(url: &Url) -> Option<u16> {
-        url.port_or_known_default()
-            .or_else(|| (url.scheme() == "moqt").then_some(443))
+fn same_endpoint(
+    origin: &crate::NamespaceOrigin,
+    local_url: &Url,
+    local_addrs: &[SocketAddr],
+) -> bool {
+    if let Some(addr) = origin.addr() {
+        if !local_addrs.is_empty() {
+            return local_addrs.contains(&addr);
+        }
     }
 
-    left.host_str() == right.host_str() && port(left) == port(right)
+    let origin_url = origin.url();
+    crate::same_relay_url(&origin_url, local_url)
 }
 
 async fn remove_empty_remote_slot(
@@ -1083,15 +1120,18 @@ impl Remote {
         }
     }
 
-    fn fetch(&self, request: StandaloneFetch, params: KeyValuePairs) -> Result<Fetch, ServeError> {
+    async fn fetch(
+        &self,
+        request: StandaloneFetch,
+        params: KeyValuePairs,
+    ) -> Result<Fetch, moq_transport::session::SessionError> {
         if !self.is_connected() {
-            return Err(ServeError::internal_ctx(format!(
-                "remote connection to {} is closed",
-                self.url
-            )));
+            return Err(moq_transport::session::SessionError::Serve(
+                ServeError::internal_ctx(format!("remote connection to {} is closed", self.url)),
+            ));
         }
         let mut subscriber = self.subscriber.clone();
-        subscriber.fetch(request, params)
+        subscriber.fetch_wait(request, params).await
     }
 
     /// Forward a `SUBSCRIBE_NAMESPACE` to this peer (Subscriber role).

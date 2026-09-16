@@ -1140,6 +1140,24 @@ impl Publisher {
 }
 
 fn validate_fetch_params(params: &KeyValuePairs) -> Result<(), crate::coding::DecodeError> {
+    use crate::message::parameter_type;
+
+    if params.0.iter().any(|param| {
+        !matches!(
+            param.key,
+            parameter_type::DELIVERY_TIMEOUT
+                | parameter_type::AUTHORIZATION_TOKEN
+                | parameter_type::EXPIRES
+                | parameter_type::LARGEST_OBJECT
+                | parameter_type::FORWARD
+                | parameter_type::SUBSCRIBER_PRIORITY
+                | parameter_type::SUBSCRIPTION_FILTER
+                | parameter_type::GROUP_ORDER
+                | parameter_type::NEW_GROUP_REQUEST
+        )
+    }) {
+        return Err(crate::coding::DecodeError::InvalidParameter);
+    }
     params.subscriber_priority()?;
     params.group_order()?;
     Ok(())
@@ -1173,6 +1191,10 @@ mod tests {
         let mut order = crate::coding::KeyValuePairs::default();
         order.set_intvalue(crate::message::parameter_type::GROUP_ORDER, 0);
         assert!(validate_fetch_params(&order).is_err());
+
+        let mut unknown = crate::coding::KeyValuePairs::default();
+        unknown.set_intvalue(0x40, 1);
+        assert!(validate_fetch_params(&unknown).is_err());
     }
 
     #[test]

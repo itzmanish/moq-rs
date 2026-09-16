@@ -151,6 +151,11 @@ impl Relay {
             .iter()
             .map(|endpoint| endpoint.client.clone())
             .collect::<Vec<_>>();
+        let local_addrs = remote_clients
+            .iter()
+            .filter_map(|client| client.local_addr().ok())
+            .filter(|addr| !addr.ip().is_unspecified())
+            .collect::<Vec<_>>();
 
         // Create remote manager - uses coordinator for namespace lookups
         let mut remotes = RemoteManager::new_with_session_config(
@@ -161,7 +166,7 @@ impl Relay {
         .with_cache_idle_timeout(cache_idle_timeout);
         if config.connection_tagger.is_some() {
             if let Some(node) = config.node.clone() {
-                remotes = remotes.with_local_url(node);
+                remotes = remotes.with_local_url(node).with_local_addrs(local_addrs);
             }
         }
         let (upstream_namespaces, upstream_namespaces_runner) =

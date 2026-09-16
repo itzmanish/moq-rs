@@ -794,7 +794,7 @@ mod tests {
         data::{FetchHeader, StreamHeader, StreamHeaderType},
         message::{self, parameter_type, FetchType, GroupOrder, Message, RequestErrorCode},
         serve::ServeError,
-        session::{Session, SessionError},
+        session::{Session, SessionConfig, SessionError},
         setup,
     };
 
@@ -1254,9 +1254,14 @@ mod tests {
         let origin_connection = async move {
             let (transport, info) = origin_server.accept().await.unwrap();
             accepts_for_connection.fetch_add(1, Ordering::Relaxed);
-            let (session, relay_publisher, _) = Session::accept(transport, None, info.transport)
-                .await
-                .unwrap();
+            let (session, relay_publisher, _) = Session::accept_with_config(
+                transport,
+                None,
+                info.transport,
+                SessionConfig { max_request_id: 4 },
+            )
+            .await
+            .unwrap();
             let origin = Producer::new(
                 relay_publisher.unwrap(),
                 origin_locals_for_connection,
@@ -1291,7 +1296,6 @@ mod tests {
             params.set_bytesvalue(parameter_type::AUTHORIZATION_TOKEN, b"private".to_vec());
             params.set_subscriber_priority(7);
             params.set_group_order(GroupOrder::Descending);
-            params.set_intvalue(0x40, 9);
             write(
                 &mut downstream.control_send,
                 &fetch_request_with_params(0, &namespace, params.clone()),
@@ -1319,7 +1323,6 @@ mod tests {
                     .params
                     .get(parameter_type::AUTHORIZATION_TOKEN)
                     .is_none());
-                assert!(request.params.get(0x40).is_none());
             }
             send_fetch_ok(
                 &publisher.transport,
@@ -1351,9 +1354,10 @@ mod tests {
             assert_eq!(bodies.len(), 2);
             assert!(bodies.contains_key(&0));
             assert!(bodies.contains_key(&2));
+            assert_eq!(bodies.get(&0).map(Vec::as_slice), Some(b"first".as_slice()));
             assert_eq!(
-                bodies.into_values().collect::<HashSet<_>>(),
-                HashSet::from([b"first".to_vec(), b"second".to_vec()])
+                bodies.get(&2).map(Vec::as_slice),
+                Some(b"second".as_slice())
             );
 
             write(&mut downstream.control_send, &fetch_request(4, &namespace)).await;

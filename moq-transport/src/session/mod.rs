@@ -54,6 +54,7 @@ use std::sync::{Arc, Mutex};
 use crate::coding::{KeyValuePairs, Value};
 use crate::message::Message;
 use crate::mlog;
+use crate::serve::ServeError;
 use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
@@ -958,15 +959,25 @@ impl Session {
     /// inbound control messages, receiving and processing new inbound uni-directional QUIC streams,
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
-        tokio::select! {
-            res = Self::run_recv(self.session_id.clone(), self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
+        let cleanup = self.subscriber.clone();
+        let result = tokio::select! {
+            res = Self::run_recv(self.session_id.clone(), self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone(), self.outgoing.clone()) => res,
             res = Self::run_send(self.session_id.clone(), self.sender, self.outgoing, self.mlog.clone()) => res,
             res = Self::run_subscribe_namespace_open(self.session_id.clone(), self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
             res = Self::run_subscribe_namespace_accept(self.session_id.clone(), self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), self.mlog.clone()) => res,
             res = Self::run_streams(self.session_id.clone(), self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
             res = Self::run_pending_timeouts(self.session_id, self.publisher, self.subscriber, self.pending_requests) => res,
+        };
+        self.request_id.close();
+        if let Some(subscriber) = cleanup {
+            let err = match &result {
+                Ok(()) => ServeError::Done,
+                Err(err) => ServeError::Closed(err.code()),
+            };
+            subscriber.close_fetches(err);
         }
+        result
     }
 
     /// Processes the outgoing control message queue, and sends queued messages on the control stream sender/writer.
@@ -1151,6 +1162,7 @@ impl Session {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         pending_requests: PendingRequests,
+        mut outgoing: Queue<Message>,
     ) -> Result<(), SessionError> {
         let mut goaway_received = false;
 
@@ -1279,7 +1291,11 @@ impl Session {
                         "received REQUESTS_BLOCKED"
                     );
                     // REQUESTS_BLOCKED tells us the peer's send budget is exhausted.
-                    request_id.handle_requests_blocked(m)?;
+                    if let Some(update) = request_id.handle_requests_blocked(m)? {
+                        outgoing
+                            .push(update.into())
+                            .map_err(|_| SessionError::Internal)?;
+                    }
                 }
                 other => {
                     tracing::warn!(session_id = %session_id, msg_type = other.name(), "received unhandled message type");
