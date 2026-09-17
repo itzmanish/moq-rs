@@ -223,7 +223,9 @@ impl FetchRequestedRecv {
         if state.closed.is_err() {
             return Ok(());
         }
-        let mut state = state.into_mut().ok_or(ServeError::Done)?;
+        let Some(mut state) = state.into_mut() else {
+            return Ok(());
+        };
         state.closed = Err(ServeError::Cancel);
         Ok(())
     }
@@ -349,6 +351,15 @@ mod tests {
             outgoing: receiver,
             active,
         }
+    }
+
+    #[test]
+    fn cancel_after_fetch_request_drop_is_benign() {
+        let (request, state) = State::<FetchRequestedState>::default().split();
+        let mut recv = FetchRequestedRecv { state };
+        drop(request);
+
+        assert!(recv.cancel().is_ok());
     }
 
     #[tokio::test]

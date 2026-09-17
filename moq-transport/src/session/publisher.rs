@@ -1139,24 +1139,7 @@ impl Publisher {
 }
 
 fn validate_fetch_params(params: &KeyValuePairs) -> Result<(), crate::coding::DecodeError> {
-    use crate::message::parameter_type;
-
-    if params.0.iter().any(|param| {
-        !matches!(
-            param.key,
-            parameter_type::DELIVERY_TIMEOUT
-                | parameter_type::AUTHORIZATION_TOKEN
-                | parameter_type::EXPIRES
-                | parameter_type::LARGEST_OBJECT
-                | parameter_type::FORWARD
-                | parameter_type::SUBSCRIBER_PRIORITY
-                | parameter_type::SUBSCRIPTION_FILTER
-                | parameter_type::GROUP_ORDER
-                | parameter_type::NEW_GROUP_REQUEST
-        )
-    }) {
-        return Err(crate::coding::DecodeError::InvalidParameter);
-    }
+    crate::message::validate_message_parameter_types(params)?;
     params.subscriber_priority()?;
     params.group_order()?;
     Ok(())
@@ -1194,6 +1177,21 @@ mod tests {
         let mut unknown = crate::coding::KeyValuePairs::default();
         unknown.set_intvalue(0x40, 1);
         assert!(validate_fetch_params(&unknown).is_err());
+    }
+
+    #[test]
+    fn fetch_parameters_ignore_known_inapplicable_values() {
+        use crate::message::parameter_type;
+
+        let mut params = crate::coding::KeyValuePairs::default();
+        params.set_intvalue(parameter_type::DELIVERY_TIMEOUT, 1);
+        params.set_intvalue(parameter_type::EXPIRES, 1);
+        params.set_bytesvalue(parameter_type::LARGEST_OBJECT, Vec::new());
+        params.set_intvalue(parameter_type::FORWARD, 2);
+        params.set_bytesvalue(parameter_type::SUBSCRIPTION_FILTER, Vec::new());
+        params.set_intvalue(parameter_type::NEW_GROUP_REQUEST, 1);
+
+        assert!(validate_fetch_params(&params).is_ok());
     }
 
     #[test]

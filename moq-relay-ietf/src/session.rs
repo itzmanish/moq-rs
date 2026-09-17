@@ -506,7 +506,7 @@ impl Session {
     ///
     /// The transport `Publisher` queues incoming SUBSCRIBE messages as
     /// `Subscribed` events. Dropping a `Subscribed` without calling `ok()`
-    /// triggers its `Drop` impl, which sends SUBSCRIBE_ERROR back to the
+    /// triggers its `Drop` impl, which sends REQUEST_ERROR back to the
     /// peer. FETCH is rejected explicitly with REQUEST_ERROR.
     async fn drain_and_reject_subscribes(mut publisher: Publisher) -> Result<(), SessionError> {
         loop {

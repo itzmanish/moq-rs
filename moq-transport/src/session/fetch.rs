@@ -145,14 +145,18 @@ impl FetchRecv {
     }
 
     pub fn recv_error(&mut self, error: &message::RequestError) -> Result<(), ServeError> {
-        let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
+        let Some(mut state) = self.state.lock_mut() else {
+            return Ok(());
+        };
         state.request_error = Some(error.clone());
         state.closed = Err(ServeError::Closed(error.error_code));
         Ok(())
     }
 
     pub fn recv_timeout(&mut self, err: ServeError) -> Result<(), ServeError> {
-        let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
+        let Some(mut state) = self.state.lock_mut() else {
+            return Ok(());
+        };
         state.closed = Err(err);
         Ok(())
     }
@@ -181,5 +185,36 @@ async fn wait_closed(state: State<FetchState>) -> ServeError {
             Some(notify) => notify.await,
             None => return ServeError::Done,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_error_after_fetch_drop_is_benign() {
+        let (fetch, state) = State::<FetchState>::default().split();
+        let mut recv = FetchRecv {
+            state,
+            start: Default::default(),
+        };
+        drop(fetch);
+
+        let error =
+            message::RequestError::new(0, message::RequestErrorCode::InternalError, 0, "failed");
+        assert!(recv.recv_error(&error).is_ok());
+    }
+
+    #[test]
+    fn timeout_after_fetch_drop_is_benign() {
+        let (fetch, state) = State::<FetchState>::default().split();
+        let mut recv = FetchRecv {
+            state,
+            start: Default::default(),
+        };
+        drop(fetch);
+
+        assert!(recv.recv_timeout(ServeError::Cancel).is_ok());
     }
 }

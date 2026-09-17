@@ -692,6 +692,7 @@ impl Subscriber {
     }
 
     fn recv_fetch_ok(&mut self, msg: &message::FetchOk) -> Result<(), SessionError> {
+        message::validate_message_parameter_types(&msg.params)?;
         if self
             .fetches
             .lock()
@@ -1735,6 +1736,49 @@ mod tests {
         assert_ne!(first_request.id, second_request.id);
     }
 
+    #[tokio::test]
+    async fn fetch_exhaustion_sends_requests_blocked_once_without_state() {
+        let mut subscriber = Subscriber::new(
+            Queue::default(),
+            Queue::default(),
+            None,
+            RequestId::new(0, 2, 100, 0),
+            PendingRequests::default(),
+            SessionId::generate(),
+        );
+        let mut outgoing = subscriber.outgoing.clone();
+
+        let fetch = subscriber
+            .fetch(standalone_fetch("video"), KeyValuePairs::default())
+            .unwrap();
+        let Some(Message::Fetch(request)) = outgoing.pop().await else {
+            panic!("expected FETCH");
+        };
+        drop(fetch);
+        assert!(matches!(
+            outgoing.pop().await,
+            Some(Message::FetchCancel(_))
+        ));
+
+        assert!(subscriber
+            .fetch(standalone_fetch("audio"), KeyValuePairs::default())
+            .is_err());
+        assert!(subscriber
+            .fetch(standalone_fetch("captions"), KeyValuePairs::default())
+            .is_err());
+
+        let Some(Message::RequestsBlocked(blocked)) = outgoing.pop().await else {
+            panic!("expected REQUESTS_BLOCKED");
+        };
+        assert_eq!(blocked.max_request_id, 2);
+        assert!(subscriber.fetches.lock().unwrap().is_empty());
+        assert_eq!(
+            subscriber.pending_requests.remove(request.id).unwrap(),
+            None
+        );
+        assert!(outgoing.close().is_empty());
+    }
+
     #[test]
     fn outbound_fetch_accepts_empty_equal_location_range() {
         let mut subscriber = subscriber();
@@ -1792,6 +1836,58 @@ mod tests {
             subscriber.recv_fetch_ok(&response),
             Err(SessionError::ProtocolViolation(_))
         ));
+    }
+
+    #[test]
+    fn fetch_ok_rejects_unknown_message_parameter() {
+        let mut subscriber = subscriber();
+        let fetch = subscriber
+            .fetch(standalone_fetch("video"), KeyValuePairs::default())
+            .unwrap();
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(0x40, 1);
+
+        let err = subscriber
+            .recv_fetch_ok(&message::FetchOk {
+                id: fetch.request.id,
+                end_of_track: true,
+                end_location: crate::coding::Location::new(1, 0),
+                params,
+                track_extensions: Default::default(),
+            })
+            .unwrap_err();
+
+        assert_eq!(err.code(), 0x3);
+    }
+
+    #[test]
+    fn fetch_ok_ignores_known_inapplicable_message_parameters() {
+        use crate::message::parameter_type;
+
+        let mut subscriber = subscriber();
+        let fetch = subscriber
+            .fetch(standalone_fetch("video"), KeyValuePairs::default())
+            .unwrap();
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(parameter_type::DELIVERY_TIMEOUT, 1);
+        params.set_bytesvalue(parameter_type::AUTHORIZATION_TOKEN, Vec::new());
+        params.set_intvalue(parameter_type::EXPIRES, 1);
+        params.set_bytesvalue(parameter_type::LARGEST_OBJECT, Vec::new());
+        params.set_intvalue(parameter_type::FORWARD, 2);
+        params.set_intvalue(parameter_type::SUBSCRIBER_PRIORITY, 256);
+        params.set_bytesvalue(parameter_type::SUBSCRIPTION_FILTER, Vec::new());
+        params.set_intvalue(parameter_type::GROUP_ORDER, 0);
+        params.set_intvalue(parameter_type::NEW_GROUP_REQUEST, 1);
+
+        assert!(subscriber
+            .recv_fetch_ok(&message::FetchOk {
+                id: fetch.request.id,
+                end_of_track: true,
+                end_location: crate::coding::Location::new(1, 0),
+                params,
+                track_extensions: Default::default(),
+            })
+            .is_ok());
     }
 
     #[test]

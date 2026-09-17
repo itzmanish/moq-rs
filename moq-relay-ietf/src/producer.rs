@@ -763,6 +763,7 @@ mod tests {
         setup,
     };
 
+    use crate::test::{test_endpoint, TestEndpoint};
     use crate::{
         Consumer, Coordinator, CoordinatorContext, CoordinatorError, CoordinatorResult, Locals,
         NamespaceOrigin, NamespaceRegistration, RemoteManager, SessionContext,
@@ -867,6 +868,18 @@ mod tests {
             }
             self.buffer
         }
+
+        async fn read_exact(&mut self, len: usize) -> Vec<u8> {
+            while self.buffer.len() < len {
+                let chunk = self.stream.read(64 * 1024).await.unwrap().unwrap();
+                self.buffer.extend_from_slice(&chunk);
+            }
+            self.buffer.drain(..len).collect()
+        }
+
+        async fn reset_code(mut self) -> u8 {
+            self.stream.closed().await.unwrap().unwrap()
+        }
     }
 
     async fn write<T: Encode>(stream: &mut web_transport::SendStream, value: &T) {
@@ -900,46 +913,13 @@ mod tests {
             .unwrap()
     }
 
-    fn test_endpoint() -> (quic::Client, quic::Server, url::Url, std::net::SocketAddr) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let certificate = certified.cert.der().clone();
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()),
-        );
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![certificate.clone()], key)
-            .unwrap();
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(certificate).unwrap();
-        let client_tls = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let tls = moq_native_ietf::tls::Config {
-            client: client_tls,
-            server: Some(server_tls),
-            fingerprints: Vec::new(),
-        };
-        let endpoint = quic::Endpoint::new(
-            quic::Config::new("0.0.0.0:0".parse().unwrap(), None, tls).unwrap(),
-        )
-        .unwrap();
-        let quic_client = endpoint.client;
-        let server = endpoint.server.unwrap();
-        let port = server.local_addr().unwrap().port();
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let url = url::Url::parse("moqt://localhost/").unwrap();
-        (quic_client, server, url, addr)
-    }
-
     async fn manual_peer_inner() -> ManualPeer {
-        let (quic_client, mut server, url, addr) = test_endpoint();
+        let TestEndpoint {
+            client: quic_client,
+            mut server,
+            url,
+            addr,
+        } = test_endpoint();
         let (client_connection, server_connection) =
             tokio::join!(quic_client.connect(&url, Some(addr)), server.accept());
         let (client_transport, _, client_kind) = client_connection.unwrap();
@@ -973,13 +953,14 @@ mod tests {
         }
     }
 
-    fn fetch_request(id: u64, namespace: &TrackNamespace) -> Message {
-        fetch_request_with_params(id, namespace, KeyValuePairs::default())
+    fn fetch_request(id: u64, namespace: &TrackNamespace, group_id: u64) -> Message {
+        fetch_request_with_params(id, namespace, group_id, KeyValuePairs::default())
     }
 
     fn fetch_request_with_params(
         id: u64,
         namespace: &TrackNamespace,
+        group_id: u64,
         params: KeyValuePairs,
     ) -> Message {
         message::Fetch {
@@ -988,8 +969,8 @@ mod tests {
             standalone_fetch: Some(message::StandaloneFetch {
                 track_namespace: namespace.clone(),
                 track_name: "video".into(),
-                start_location: Location::new(0, 0),
-                end_location: Location::new(1, 0),
+                start_location: Location::new(group_id, 0),
+                end_location: Location::new(group_id + 1, 0),
             }),
             joining_fetch: None,
             params,
@@ -997,12 +978,91 @@ mod tests {
         .into()
     }
 
-    async fn send_fetch_ok(
-        transport: &web_transport::Session,
-        control: &mut web_transport::SendStream,
-        request_id: u64,
-        body: &[u8],
-    ) {
+    fn fetch_group(request: &message::Fetch) -> u64 {
+        request
+            .standalone_fetch
+            .as_ref()
+            .unwrap()
+            .start_location
+            .group_id
+    }
+
+    fn assert_publisher_fetch(request: &message::Fetch) {
+        assert_eq!(request.id % 2, 1, "publisher-facing FETCH ID must be odd");
+    }
+
+    fn push_varint(encoded: &mut Vec<u8>, value: u64) {
+        match value {
+            0..=63 => encoded.push(value as u8),
+            64..=16_383 => encoded.extend_from_slice(&((value as u16) | 0x4000).to_be_bytes()),
+            16_384..=1_073_741_823 => {
+                encoded.extend_from_slice(&((value as u32) | 0x8000_0000).to_be_bytes())
+            }
+            1_073_741_824..=0x3fff_ffff_ffff_ffff => {
+                encoded.extend_from_slice(&(value | 0xc000_0000_0000_0000).to_be_bytes())
+            }
+            _ => panic!("test varint out of range"),
+        }
+    }
+
+    fn fetch_object(group_id: u64, object_id: u64, payload: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(payload.len() + 16);
+        push_varint(&mut encoded, 0x1c); // Group, Object, and Priority fields present.
+        push_varint(&mut encoded, group_id);
+        push_varint(&mut encoded, object_id);
+        encoded.push(17);
+        push_varint(&mut encoded, payload.len() as u64);
+        encoded.extend_from_slice(payload);
+        encoded
+    }
+
+    fn deterministic_payload(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn fetch_object_with_wire_len(group_id: u64, len: usize) -> Vec<u8> {
+        for payload_len in len.saturating_sub(16)..len {
+            let body = fetch_object(group_id, 0, &deterministic_payload(payload_len, group_id));
+            if body.len() == len {
+                return body;
+            }
+        }
+        panic!("could not build FETCH object with wire length {len}");
+    }
+
+    fn authorization_token(value: &[u8]) -> Vec<u8> {
+        let mut token = Vec::with_capacity(value.len() + 2);
+        push_varint(&mut token, 0x03); // USE_VALUE
+        push_varint(&mut token, 0x00); // Application-defined token type.
+        token.extend_from_slice(value);
+        token
+    }
+
+    #[derive(Clone, Copy)]
+    enum FetchResponseOrder {
+        StreamFirst,
+        OkFirst,
+    }
+
+    fn fetch_ok(request: &message::Fetch) -> Message {
+        Message::FetchOk(message::FetchOk {
+            id: request.id,
+            end_of_track: false,
+            end_location: request.standalone_fetch.as_ref().unwrap().end_location,
+            params: KeyValuePairs::default(),
+            track_extensions: Default::default(),
+        })
+    }
+
+    async fn send_fetch_stream(transport: &web_transport::Session, request_id: u64, body: &[u8]) {
         let mut stream = transport.open_uni().await.unwrap();
         write(
             &mut stream,
@@ -1014,26 +1074,67 @@ mod tests {
         .await;
         write_bytes(&mut stream, body).await;
         stream.finish().unwrap();
-        write(
-            control,
-            &Message::FetchOk(message::FetchOk {
-                id: request_id,
-                end_of_track: true,
-                end_location: Location::new(1, 0),
-                params: KeyValuePairs::default(),
-                track_extensions: Default::default(),
-            }),
-        )
-        .await;
     }
 
-    async fn receive_fetch_stream(transport: &web_transport::Session) -> (u64, Vec<u8>) {
+    async fn send_fetch_success(
+        transport: &web_transport::Session,
+        control: &mut web_transport::SendStream,
+        request: &message::Fetch,
+        body: &[u8],
+        order: FetchResponseOrder,
+    ) {
+        if matches!(order, FetchResponseOrder::OkFirst) {
+            write(control, &fetch_ok(request)).await;
+        }
+        send_fetch_stream(transport, request.id, body).await;
+        if matches!(order, FetchResponseOrder::StreamFirst) {
+            write(control, &fetch_ok(request)).await;
+        }
+    }
+
+    async fn receive_fetch_reader(transport: &web_transport::Session) -> (u64, WireReader) {
         let stream = transport.accept_uni().await.unwrap();
         let mut stream = WireReader::new(stream);
         let header: StreamHeader = stream.decode().await;
         let id = header.fetch_header.unwrap().request_id;
+        (id, stream)
+    }
+
+    async fn receive_fetch_stream(transport: &web_transport::Session) -> (u64, Vec<u8>) {
+        let (id, stream) = receive_fetch_reader(transport).await;
         let body = stream.read_to_end().await;
         (id, body)
+    }
+
+    async fn receive_reset_stream(transport: &web_transport::Session, code: u8) {
+        let mut stream = transport.accept_uni().await.unwrap();
+        assert_eq!(stream.closed().await.unwrap(), Some(code));
+    }
+
+    async fn receive_fetch_ok(control: &mut WireReader, id: u64) {
+        let Message::FetchOk(ok) = control.decode::<Message>().await else {
+            panic!("expected FETCH_OK");
+        };
+        assert_eq!(ok.id, id);
+    }
+
+    async fn publisher_control_barrier(
+        send: &mut web_transport::SendStream,
+        recv: &mut WireReader,
+    ) {
+        write(
+            send,
+            &Message::PublishNamespace(message::PublishNamespace {
+                id: 2,
+                track_namespace: TrackNamespace::from_utf8_path("test/fetch-ok-barrier"),
+                params: KeyValuePairs::default(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            recv.decode::<Message>().await,
+            Message::RequestOk(message::RequestOk { id: 2, .. })
+        ));
     }
 
     #[tokio::test]
@@ -1077,39 +1178,114 @@ mod tests {
                 Message::RequestOk(message::RequestOk { id: 0, .. })
             ));
 
-            let body = b"opaque fetch body";
-            write(&mut downstream.control_send, &fetch_request(0, &namespace)).await;
-            let Message::Fetch(first) = upstream.control_recv.decode::<Message>().await else {
-                panic!("expected upstream FETCH");
-            };
-            send_fetch_ok(
-                &upstream.transport,
-                &mut upstream.control_send,
-                first.id,
-                body,
-            )
-            .await;
-
-            assert_eq!(
-                receive_fetch_stream(&downstream.transport).await,
-                (0, body.to_vec())
-            );
-            assert!(matches!(
-                downstream.control_recv.decode::<Message>().await,
-                Message::FetchOk(message::FetchOk {
-                    id: 0,
-                    end_of_track: true,
-                    ..
-                })
-            ));
-
-            let mut upstream_ids = HashSet::from([first.id]);
-            for (id, reason) in [(2, "first miss"), (4, "second miss")] {
-                write(&mut downstream.control_send, &fetch_request(id, &namespace)).await;
+            let bodies = vec![
+                (fetch_object(0, 0, &[]), None),
+                (fetch_object(1, 0, &[7]), None),
+                (fetch_object_with_wire_len(2, 65_535), Some(65_535)),
+                (fetch_object_with_wire_len(3, 65_536), Some(65_536)),
+                (fetch_object_with_wire_len(4, 65_537), Some(65_537)),
+                (
+                    fetch_object_with_wire_len(5, 3 * 65_536 + 17),
+                    Some(3 * 65_536 + 17),
+                ),
+            ];
+            let mut upstream_ids = HashSet::new();
+            for (case, (body, expected_len)) in bodies.into_iter().enumerate() {
+                let id = (case * 2) as u64;
+                let group_id = case as u64;
+                if let Some(expected_len) = expected_len {
+                    assert_eq!(body.len(), expected_len);
+                }
+                write(
+                    &mut downstream.control_send,
+                    &fetch_request(id, &namespace, group_id),
+                )
+                .await;
                 let Message::Fetch(request) = upstream.control_recv.decode::<Message>().await
                 else {
                     panic!("expected upstream FETCH");
                 };
+                assert_publisher_fetch(&request);
+                assert!(upstream_ids.insert(request.id));
+                assert_eq!(fetch_group(&request), group_id);
+                match case {
+                    0 => {
+                        send_fetch_stream(&upstream.transport, request.id, &body).await;
+                        let (downstream_id, mut reader) =
+                            receive_fetch_reader(&downstream.transport).await;
+                        assert_eq!(downstream_id, id);
+                        assert_eq!(reader.read_exact(body.len()).await, body);
+                        write(&mut upstream.control_send, &fetch_ok(&request)).await;
+                        assert!(reader.read_to_end().await.is_empty());
+                        receive_fetch_ok(&mut downstream.control_recv, id).await;
+                    }
+                    1 => {
+                        write(&mut upstream.control_send, &fetch_ok(&request)).await;
+                        publisher_control_barrier(
+                            &mut upstream.control_send,
+                            &mut upstream.control_recv,
+                        )
+                        .await;
+                        send_fetch_stream(&upstream.transport, request.id, &body).await;
+                        assert_eq!(
+                            receive_fetch_stream(&downstream.transport).await,
+                            (id, body)
+                        );
+                        receive_fetch_ok(&mut downstream.control_recv, id).await;
+                    }
+                    _ => {
+                        send_fetch_success(
+                            &upstream.transport,
+                            &mut upstream.control_send,
+                            &request,
+                            &body,
+                            FetchResponseOrder::StreamFirst,
+                        )
+                        .await;
+                        assert_eq!(
+                            receive_fetch_stream(&downstream.transport).await,
+                            (id, body)
+                        );
+                        receive_fetch_ok(&mut downstream.control_recv, id).await;
+                    }
+                }
+            }
+
+            write(
+                &mut downstream.control_send,
+                &fetch_request(12, &namespace, 6),
+            )
+            .await;
+            let Message::Fetch(empty) = upstream.control_recv.decode::<Message>().await else {
+                panic!("expected empty upstream FETCH");
+            };
+            assert_publisher_fetch(&empty);
+            assert!(upstream_ids.insert(empty.id));
+            send_fetch_success(
+                &upstream.transport,
+                &mut upstream.control_send,
+                &empty,
+                &[],
+                FetchResponseOrder::OkFirst,
+            )
+            .await;
+            assert_eq!(
+                receive_fetch_stream(&downstream.transport).await,
+                (12, Vec::new())
+            );
+            receive_fetch_ok(&mut downstream.control_recv, 12).await;
+
+            for (id, group_id, reason) in [(14, 7, "first miss"), (16, 8, "second miss")] {
+                write(
+                    &mut downstream.control_send,
+                    &fetch_request(id, &namespace, group_id),
+                )
+                .await;
+                let Message::Fetch(request) = upstream.control_recv.decode::<Message>().await
+                else {
+                    panic!("expected upstream FETCH");
+                };
+                assert_publisher_fetch(&request);
                 assert!(upstream_ids.insert(request.id));
                 write(
                     &mut upstream.control_send,
@@ -1129,22 +1305,33 @@ mod tests {
                 assert_eq!(error.id, id);
                 assert_eq!(error.error_code, RequestErrorCode::DoesNotExist as u64);
                 assert_eq!(error.reason.0, reason);
+                receive_reset_stream(&downstream.transport, 0).await;
             }
 
-            write(&mut downstream.control_send, &fetch_request(6, &namespace)).await;
-            let Message::Fetch(request) = upstream.control_recv.decode::<Message>().await else {
-                panic!("expected cancellable upstream FETCH");
-            };
-            assert!(upstream_ids.insert(request.id));
             write(
                 &mut downstream.control_send,
-                &Message::FetchCancel(message::FetchCancel { id: 6 }),
+                &fetch_request(18, &namespace, 9),
             )
             .await;
-            assert!(matches!(
-                upstream.control_recv.decode::<Message>().await,
-                Message::FetchCancel(message::FetchCancel { id }) if id == request.id
-            ));
+            let Message::Fetch(recovered) = upstream.control_recv.decode::<Message>().await else {
+                panic!("expected successful upstream FETCH after REQUEST_ERROR");
+            };
+            assert_publisher_fetch(&recovered);
+            assert!(upstream_ids.insert(recovered.id));
+            let body = fetch_object(9, 0, &deterministic_payload(31, 9));
+            send_fetch_success(
+                &upstream.transport,
+                &mut upstream.control_send,
+                &recovered,
+                &body,
+                FetchResponseOrder::StreamFirst,
+            )
+            .await;
+            assert_eq!(
+                receive_fetch_stream(&downstream.transport).await,
+                (18, body)
+            );
+            receive_fetch_ok(&mut downstream.control_recv, 18).await;
             assert_eq!(lookups.load(Ordering::Relaxed), 0);
         };
 
@@ -1165,7 +1352,12 @@ mod tests {
     async fn two_relay_fetch_is_fresh_and_cache_free() {
         let mut downstream = manual_peer().await;
         let mut publisher = manual_peer().await;
-        let (route_client, mut origin_server, origin_url, origin_addr) = test_endpoint();
+        let TestEndpoint {
+            client: route_client,
+            server: mut origin_server,
+            url: origin_url,
+            addr: origin_addr,
+        } = test_endpoint();
         let edge_coordinator =
             MockCoordinator::with_route(origin_url.clone(), origin_addr, route_client);
         let edge_lookups = edge_coordinator.lookups.clone();
@@ -1232,17 +1424,20 @@ mod tests {
             ));
 
             let mut params = KeyValuePairs::default();
-            params.set_bytesvalue(parameter_type::AUTHORIZATION_TOKEN, b"private".to_vec());
+            params.set_bytesvalue(
+                parameter_type::AUTHORIZATION_TOKEN,
+                authorization_token(b"private"),
+            );
             params.set_subscriber_priority(7);
             params.set_group_order(GroupOrder::Descending);
             write(
                 &mut downstream.control_send,
-                &fetch_request_with_params(0, &namespace, params.clone()),
+                &fetch_request_with_params(0, &namespace, 0, params.clone()),
             )
             .await;
             write(
                 &mut downstream.control_send,
-                &fetch_request_with_params(2, &namespace, params),
+                &fetch_request_with_params(2, &namespace, 1, params.clone()),
             )
             .await;
             let Message::Fetch(first) = publisher.control_recv.decode::<Message>().await else {
@@ -1252,7 +1447,9 @@ mod tests {
                 panic!("expected second publisher FETCH");
             };
             assert_ne!(first.id, second.id);
-            for request in [&first, &second] {
+            let mut requests = HashMap::new();
+            for request in [first, second] {
+                assert_publisher_fetch(&request);
                 assert_eq!(
                     request.params.group_order().unwrap(),
                     Some(GroupOrder::Descending)
@@ -1262,64 +1459,87 @@ mod tests {
                     .params
                     .get(parameter_type::AUTHORIZATION_TOKEN)
                     .is_none());
+                let group_id = fetch_group(&request);
+                assert!(requests.insert(group_id, request).is_none());
             }
-            send_fetch_ok(
+            let first = requests.remove(&0).expect("missing group 0 FETCH");
+            let second = requests.remove(&1).expect("missing group 1 FETCH");
+            assert!(requests.is_empty());
+            let mut upstream_ids = HashSet::from([first.id, second.id]);
+            let first_body = fetch_object(0, 0, &deterministic_payload(37, 0));
+            let second_body = fetch_object(1, 0, &deterministic_payload(91, 1));
+            send_fetch_success(
                 &publisher.transport,
                 &mut publisher.control_send,
-                second.id,
-                b"second",
+                &second,
+                &second_body,
+                FetchResponseOrder::OkFirst,
             )
             .await;
-            send_fetch_ok(
+            send_fetch_success(
                 &publisher.transport,
                 &mut publisher.control_send,
-                first.id,
-                b"first",
+                &first,
+                &first_body,
+                FetchResponseOrder::StreamFirst,
             )
             .await;
             let responses = [
                 receive_fetch_stream(&downstream.transport).await,
                 receive_fetch_stream(&downstream.transport).await,
             ];
-            let mut response_ids = HashSet::new();
+            let mut response_locations = HashMap::new();
             for _ in 0..2 {
                 let Message::FetchOk(ok) = downstream.control_recv.decode::<Message>().await else {
                     panic!("expected FETCH_OK");
                 };
-                response_ids.insert(ok.id);
+                assert!(response_locations.insert(ok.id, ok.end_location).is_none());
             }
-            assert_eq!(response_ids, HashSet::from([0, 2]));
+            assert_eq!(response_locations.get(&0), Some(&Location::new(1, 0)));
+            assert_eq!(response_locations.get(&2), Some(&Location::new(2, 0)));
             let bodies: HashMap<_, _> = responses.into_iter().collect();
-            assert_eq!(bodies.get(&0).map(Vec::as_slice), Some(b"first".as_slice()));
-            assert_eq!(
-                bodies.get(&2).map(Vec::as_slice),
-                Some(b"second".as_slice())
-            );
+            assert_eq!(bodies.get(&0), Some(&first_body));
+            assert_eq!(bodies.get(&2), Some(&second_body));
 
-            write(&mut downstream.control_send, &fetch_request(4, &namespace)).await;
+            write(
+                &mut downstream.control_send,
+                &fetch_request_with_params(4, &namespace, 0, params),
+            )
+            .await;
             let Message::Fetch(third) = publisher.control_recv.decode::<Message>().await else {
                 panic!("expected sequential publisher FETCH");
             };
-            assert_ne!(third.id, first.id);
-            assert_ne!(third.id, second.id);
-            send_fetch_ok(
+            assert_publisher_fetch(&third);
+            assert!(upstream_ids.insert(third.id));
+            assert_eq!(fetch_group(&third), 0);
+            assert_eq!(
+                third.standalone_fetch.as_ref(),
+                first.standalone_fetch.as_ref()
+            );
+            assert_eq!(third.params, first.params);
+            let repeat_body = fetch_object(0, 0, &deterministic_payload(53, 99));
+            send_fetch_success(
                 &publisher.transport,
                 &mut publisher.control_send,
-                third.id,
-                b"third",
+                &third,
+                &repeat_body,
+                FetchResponseOrder::OkFirst,
             )
             .await;
             let response = receive_fetch_stream(&downstream.transport).await;
-            let Message::FetchOk(ok) = downstream.control_recv.decode::<Message>().await else {
-                panic!("expected sequential FETCH_OK");
-            };
-            assert_eq!(ok.id, response.0);
-            assert_eq!(response, (4, b"third".to_vec()));
+            receive_fetch_ok(&mut downstream.control_recv, 4).await;
+            assert_eq!(response, (4, repeat_body));
 
-            write(&mut downstream.control_send, &fetch_request(6, &namespace)).await;
+            write(
+                &mut downstream.control_send,
+                &fetch_request(6, &namespace, 2),
+            )
+            .await;
             let Message::Fetch(failed) = publisher.control_recv.decode::<Message>().await else {
                 panic!("expected failed publisher FETCH");
             };
+            assert_publisher_fetch(&failed);
+            assert!(upstream_ids.insert(failed.id));
             write(
                 &mut publisher.control_send,
                 &Message::RequestError(message::RequestError::new(
@@ -1335,32 +1555,124 @@ mod tests {
                 panic!("expected downstream REQUEST_ERROR");
             };
             assert_eq!(error.id, 6);
+            assert_eq!(error.error_code, RequestErrorCode::DoesNotExist as u64);
             assert_eq!(error.retry_interval, 42);
             assert_eq!(error.reason.0, "origin miss");
+            receive_reset_stream(&downstream.transport, 0).await;
 
-            write(&mut downstream.control_send, &fetch_request(8, &namespace)).await;
+            write(
+                &mut downstream.control_send,
+                &fetch_request(8, &namespace, 3),
+            )
+            .await;
+            let Message::Fetch(recovered) = publisher.control_recv.decode::<Message>().await else {
+                panic!("expected successful FETCH after REQUEST_ERROR");
+            };
+            assert_publisher_fetch(&recovered);
+            assert!(upstream_ids.insert(recovered.id));
+            let recovered_body = fetch_object(3, 0, &deterministic_payload(113, 3));
+            send_fetch_success(
+                &publisher.transport,
+                &mut publisher.control_send,
+                &recovered,
+                &recovered_body,
+                FetchResponseOrder::StreamFirst,
+            )
+            .await;
+            assert_eq!(
+                receive_fetch_stream(&downstream.transport).await,
+                (8, recovered_body)
+            );
+            receive_fetch_ok(&mut downstream.control_recv, 8).await;
+
+            write(
+                &mut downstream.control_send,
+                &fetch_request(10, &namespace, 4),
+            )
+            .await;
             let Message::Fetch(cancelled) = publisher.control_recv.decode::<Message>().await else {
                 panic!("expected cancellable publisher FETCH");
             };
+            assert_publisher_fetch(&cancelled);
+            assert!(upstream_ids.insert(cancelled.id));
+            let cancel_payload = deterministic_payload(3 * 65_536 + 17, 4);
+            let cancel_body = fetch_object(4, 0, &cancel_payload);
+            let framing_len = cancel_body.len() - cancel_payload.len();
+            let partial_len = framing_len + 65_536 + 1024;
+            assert!(partial_len > 65_536);
+            let mut upstream_stream = publisher.transport.open_uni().await.unwrap();
             write(
-                &mut downstream.control_send,
-                &Message::FetchCancel(message::FetchCancel { id: 8 }),
+                &mut upstream_stream,
+                &FetchHeader {
+                    header_type: StreamHeaderType::Fetch,
+                    request_id: cancelled.id,
+                },
             )
             .await;
-            assert!(matches!(
-                publisher.control_recv.decode::<Message>().await,
-                Message::FetchCancel(message::FetchCancel { id }) if id == cancelled.id
-            ));
+            write_bytes(&mut upstream_stream, &cancel_body[..partial_len]).await;
 
-            write(&mut downstream.control_send, &fetch_request(10, &missing)).await;
+            let (cancelled_id, mut downstream_stream) =
+                receive_fetch_reader(&downstream.transport).await;
+            assert_eq!(cancelled_id, 10);
+            assert_eq!(
+                downstream_stream.read_exact(partial_len).await,
+                cancel_body[..partial_len]
+            );
+            write(
+                &mut downstream.control_send,
+                &Message::FetchCancel(message::FetchCancel { id: 10 }),
+            )
+            .await;
+            let upstream_cancel = async {
+                assert!(matches!(
+                    publisher.control_recv.decode::<Message>().await,
+                    Message::FetchCancel(message::FetchCancel { id }) if id == cancelled.id
+                ));
+            };
+            let ((), downstream_reset) =
+                tokio::join!(upstream_cancel, downstream_stream.reset_code());
+            assert_eq!(downstream_reset, 1);
+            upstream_stream.reset(0);
+
+            write(
+                &mut downstream.control_send,
+                &fetch_request(12, &namespace, 5),
+            )
+            .await;
+            let Message::Fetch(after_cancel) = publisher.control_recv.decode::<Message>().await
+            else {
+                panic!("expected successful FETCH after cancellation");
+            };
+            assert_publisher_fetch(&after_cancel);
+            assert!(upstream_ids.insert(after_cancel.id));
+            let after_cancel_body = fetch_object(5, 0, &deterministic_payload(67, 5));
+            send_fetch_success(
+                &publisher.transport,
+                &mut publisher.control_send,
+                &after_cancel,
+                &after_cancel_body,
+                FetchResponseOrder::OkFirst,
+            )
+            .await;
+            assert_eq!(
+                receive_fetch_stream(&downstream.transport).await,
+                (12, after_cancel_body)
+            );
+            receive_fetch_ok(&mut downstream.control_recv, 12).await;
+
+            write(
+                &mut downstream.control_send,
+                &fetch_request(14, &missing, 6),
+            )
+            .await;
             let Message::RequestError(error) = downstream.control_recv.decode::<Message>().await
             else {
                 panic!("expected missing-track REQUEST_ERROR");
             };
-            assert_eq!(error.id, 10);
+            assert_eq!(error.id, 14);
             assert_eq!(error.error_code, RequestErrorCode::DoesNotExist as u64);
             assert_eq!(origin_lookups.load(Ordering::Relaxed), 1);
-            assert_eq!(edge_lookups.load(Ordering::Relaxed), 6);
+            assert_eq!(edge_lookups.load(Ordering::Relaxed), 8);
             assert!(edge_scopes
                 .lock()
                 .unwrap()
