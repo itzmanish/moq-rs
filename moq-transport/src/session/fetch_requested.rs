@@ -142,7 +142,7 @@ impl FetchRequested {
         let webtransport = self.webtransport.as_ref().ok_or(SessionError::Internal)?;
         let mut stream = FetchStream::new(
             Writer::new(self.session_id.clone(), webtransport.open_uni().await?),
-            reset,
+            reset.clone(),
         );
         stream
             .writer
@@ -152,8 +152,17 @@ impl FetchRequested {
             })
             .await?;
 
-        while let Some(chunk) = upstream.read_stream_chunk(COPY_CHUNK_SIZE).await? {
-            stream.writer.write(&chunk).await?;
+        loop {
+            match upstream.read_stream_chunk(COPY_CHUNK_SIZE).await {
+                Ok(Some(chunk)) => stream.writer.write(&chunk).await?,
+                Ok(None) => break,
+                Err(err) => {
+                    if let Some(code) = upstream_reset_code(&err) {
+                        reset.set_raw(code);
+                    }
+                    return Err(err);
+                }
+            }
         }
 
         let response = upstream.ok().await?;
@@ -250,6 +259,21 @@ fn proxied_error(mut response: message::RequestError, request_id: u64) -> messag
     response
 }
 
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+fn upstream_reset_code(err: &SessionError) -> Option<u32> {
+    match err {
+        SessionError::WebTransport(web_transport::Error::Read(
+            web_transport::quinn::ReadError::Reset(code),
+        )) => Some(*code),
+        _ => None,
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+fn upstream_reset_code(_err: &SessionError) -> Option<u32> {
+    None
+}
+
 struct FetchStream {
     writer: Writer,
     reset: FetchReset,
@@ -293,7 +317,11 @@ impl Default for FetchReset {
 
 impl FetchReset {
     fn set(&self, code: DataStreamResetCode) {
-        self.0.store(code.into(), Ordering::Release);
+        self.set_raw(code.into());
+    }
+
+    fn set_raw(&self, code: u32) {
+        self.0.store(code, Ordering::Release);
     }
 
     fn code(&self) -> u32 {
@@ -456,6 +484,17 @@ mod tests {
         assert_eq!(mapped.error_code, error.error_code);
         assert_eq!(mapped.retry_interval, error.retry_interval);
         assert_eq!(mapped.reason, error.reason);
+    }
+
+    #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+    #[test]
+    fn upstream_reset_codes_are_preserved() {
+        for code in [0, 1, 2, 3, 4, 0x12, 0xdead_beef] {
+            let err = SessionError::WebTransport(web_transport::Error::Read(
+                web_transport::quinn::ReadError::Reset(code),
+            ));
+            assert_eq!(upstream_reset_code(&err), Some(code));
+        }
     }
 
     #[tokio::test]

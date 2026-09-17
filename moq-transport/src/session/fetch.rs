@@ -15,6 +15,7 @@ struct FetchState {
     request_error: Option<message::RequestError>,
     closed: Result<(), ServeError>,
     stream_received: bool,
+    cancel_sent: bool,
 }
 
 impl Default for FetchState {
@@ -25,6 +26,7 @@ impl Default for FetchState {
             request_error: None,
             closed: Ok(()),
             stream_received: false,
+            cancel_sent: false,
         }
     }
 }
@@ -124,12 +126,17 @@ impl Fetch {
 
 impl Drop for Fetch {
     fn drop(&mut self) {
-        let state = self.state.lock();
-        if !(self.stream_done && state.ok.is_some()) && state.closed.is_ok() {
+        let send_cancel = self.state.lock_mut().is_some_and(|mut state| {
+            let send = !(self.stream_done && state.ok.is_some())
+                && state.closed.is_ok()
+                && !state.cancel_sent;
+            state.cancel_sent |= send;
+            send
+        });
+        if send_cancel {
             self.subscriber
                 .send_message(message::FetchCancel { id: self.id });
         }
-        drop(state);
         self.subscriber.remove_fetch(self.id);
     }
 }
@@ -153,12 +160,14 @@ impl FetchRecv {
         Ok(())
     }
 
-    pub fn recv_timeout(&mut self, err: ServeError) -> Result<(), ServeError> {
+    pub fn recv_timeout(&mut self, err: ServeError) -> Result<bool, ServeError> {
         let Some(mut state) = self.state.lock_mut() else {
-            return Ok(());
+            return Ok(false);
         };
         state.closed = Err(err);
-        Ok(())
+        let send_cancel = !state.cancel_sent;
+        state.cancel_sent = true;
+        Ok(send_cancel)
     }
 
     pub fn recv_stream(&mut self, reader: Reader) -> Result<(), ServeError> {
@@ -190,6 +199,15 @@ async fn wait_closed(state: State<FetchState>) -> ServeError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use crate::{
+        coding::{KeyValuePairs, Location, TrackNamespace},
+        message::{Message, StandaloneFetch},
+        session::{PendingRequest, PendingRequests, RequestId, SessionId},
+        watch::Queue,
+    };
+
     use super::*;
 
     #[test]
@@ -215,6 +233,60 @@ mod tests {
         };
         drop(fetch);
 
-        assert!(recv.recv_timeout(ServeError::Cancel).is_ok());
+        assert_eq!(recv.recv_timeout(ServeError::Cancel), Ok(false));
+    }
+
+    #[tokio::test]
+    async fn timeout_racing_fetch_drop_sends_one_cancel() {
+        for _ in 0..100 {
+            let (outgoing, mut receiver) = Queue::default().split();
+            let keepalive = outgoing.clone();
+            let mut subscriber = Subscriber::new(
+                outgoing,
+                Queue::default(),
+                None,
+                RequestId::new(0, 100, 100, 0),
+                PendingRequests::default(),
+                SessionId::generate(),
+            );
+            let fetch = subscriber
+                .fetch(
+                    StandaloneFetch {
+                        track_namespace: TrackNamespace::from_utf8_path("test"),
+                        track_name: "video".into(),
+                        start_location: Location::new(0, 0),
+                        end_location: Location::new(1, 0),
+                    },
+                    KeyValuePairs::default(),
+                )
+                .unwrap();
+            let Message::Fetch(request) = receiver.pop().await.unwrap() else {
+                panic!("expected FETCH");
+            };
+            let barrier = Arc::new(Barrier::new(3));
+            let drop_barrier = barrier.clone();
+            let dropper = std::thread::spawn(move || {
+                drop_barrier.wait();
+                drop(fetch);
+            });
+            let timeout_barrier = barrier.clone();
+            let timeout = std::thread::spawn(move || {
+                timeout_barrier.wait();
+                subscriber
+                    .recv_request_timeout(request.id, PendingRequest::Fetch)
+                    .unwrap();
+            });
+            barrier.wait();
+            dropper.join().unwrap();
+            timeout.join().unwrap();
+
+            let cancels = receiver
+                .close()
+                .into_iter()
+                .filter(|message| matches!(message, Message::FetchCancel(_)))
+                .count();
+            assert_eq!(cancels, 1);
+            drop(keepalive);
+        }
     }
 }

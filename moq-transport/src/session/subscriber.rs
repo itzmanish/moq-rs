@@ -1137,8 +1137,9 @@ impl Subscriber {
                     .map_err(|_| SessionError::Internal)?
                     .remove(&id);
                 if let Some(mut fetch) = fetch {
-                    self.send_message(message::FetchCancel { id });
-                    fetch.recv_timeout(ServeError::internal_ctx("FETCH response timed out"))?;
+                    if fetch.recv_timeout(ServeError::internal_ctx("FETCH response timed out"))? {
+                        self.send_message(message::FetchCancel { id });
+                    }
                 }
             }
             PendingRequest::PublishNamespace | PendingRequest::Publish => {

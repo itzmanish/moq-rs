@@ -771,11 +771,13 @@ mod tests {
 
     use super::Producer;
 
+    type LookupRequest = (Option<String>, TrackNamespace);
+
     #[derive(Clone)]
     struct MockCoordinator {
         route: Option<(url::Url, std::net::SocketAddr, quic::Client)>,
         lookups: Arc<AtomicUsize>,
-        scopes: Arc<Mutex<Vec<Option<String>>>>,
+        lookup_requests: Arc<Mutex<Vec<LookupRequest>>>,
     }
 
     impl MockCoordinator {
@@ -783,7 +785,7 @@ mod tests {
             Self {
                 route: None,
                 lookups: Arc::new(AtomicUsize::new(0)),
-                scopes: Arc::new(Mutex::new(Vec::new())),
+                lookup_requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -791,7 +793,7 @@ mod tests {
             Self {
                 route: Some((url, addr, client)),
                 lookups: Arc::new(AtomicUsize::new(0)),
-                scopes: Arc::new(Mutex::new(Vec::new())),
+                lookup_requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -821,7 +823,10 @@ mod tests {
             namespace: &TrackNamespace,
         ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
             self.lookups.fetch_add(1, Ordering::Relaxed);
-            self.scopes.lock().unwrap().push(scope.map(str::to_string));
+            self.lookup_requests
+                .lock()
+                .unwrap()
+                .push((scope.map(str::to_string), namespace.clone()));
             let Some((url, addr, client)) = &self.route else {
                 return Err(CoordinatorError::NamespaceNotFound);
             };
@@ -1349,6 +1354,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_fetch_lookups_keep_scopes_isolated() {
+        let coordinator = Arc::new(MockCoordinator::without_route());
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let first = moq_transport::message::StandaloneFetch {
+            track_namespace: TrackNamespace::from_utf8_path("scope-a/fetch"),
+            track_name: "video".into(),
+            start_location: Location::new(0, 0),
+            end_location: Location::new(1, 0),
+        };
+        let second = moq_transport::message::StandaloneFetch {
+            track_namespace: TrackNamespace::from_utf8_path("scope-b/fetch"),
+            ..first.clone()
+        };
+
+        let (first_result, second_result) = tokio::join!(
+            remotes.fetch(Some("scope-a"), first, KeyValuePairs::default()),
+            remotes.fetch(Some("scope-b"), second, KeyValuePairs::default()),
+        );
+
+        assert!(first_result.unwrap().is_none());
+        assert!(second_result.unwrap().is_none());
+        let requests: HashSet<_> = coordinator
+            .lookup_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        assert_eq!(
+            requests,
+            HashSet::from([
+                (
+                    Some("scope-a".to_string()),
+                    TrackNamespace::from_utf8_path("scope-a/fetch"),
+                ),
+                (
+                    Some("scope-b".to_string()),
+                    TrackNamespace::from_utf8_path("scope-b/fetch"),
+                ),
+            ])
+        );
+    }
+
+    #[tokio::test]
     async fn two_relay_fetch_is_fresh_and_cache_free() {
         let mut downstream = manual_peer().await;
         let mut publisher = manual_peer().await;
@@ -1361,7 +1410,7 @@ mod tests {
         let edge_coordinator =
             MockCoordinator::with_route(origin_url.clone(), origin_addr, route_client);
         let edge_lookups = edge_coordinator.lookups.clone();
-        let edge_scopes = edge_coordinator.scopes.clone();
+        let edge_lookup_requests = edge_coordinator.lookup_requests.clone();
         let edge_coordinator: Arc<dyn Coordinator> = Arc::new(edge_coordinator);
         let origin_coordinator = MockCoordinator::without_route();
         let origin_lookups = origin_coordinator.lookups.clone();
@@ -1423,21 +1472,28 @@ mod tests {
                 Message::RequestOk(message::RequestOk { id: 0, .. })
             ));
 
-            let mut params = KeyValuePairs::default();
-            params.set_bytesvalue(
+            let mut first_params = KeyValuePairs::default();
+            first_params.set_bytesvalue(
                 parameter_type::AUTHORIZATION_TOKEN,
-                authorization_token(b"private"),
+                authorization_token(b"first"),
             );
-            params.set_subscriber_priority(7);
-            params.set_group_order(GroupOrder::Descending);
+            first_params.set_subscriber_priority(7);
+            first_params.set_group_order(GroupOrder::Descending);
+            let mut second_params = KeyValuePairs::default();
+            second_params.set_bytesvalue(
+                parameter_type::AUTHORIZATION_TOKEN,
+                authorization_token(b"second"),
+            );
+            second_params.set_subscriber_priority(9);
+            second_params.set_group_order(GroupOrder::Ascending);
             write(
                 &mut downstream.control_send,
-                &fetch_request_with_params(0, &namespace, 0, params.clone()),
+                &fetch_request_with_params(0, &namespace, 0, first_params.clone()),
             )
             .await;
             write(
                 &mut downstream.control_send,
-                &fetch_request_with_params(2, &namespace, 1, params.clone()),
+                &fetch_request_with_params(2, &namespace, 1, second_params),
             )
             .await;
             let Message::Fetch(first) = publisher.control_recv.decode::<Message>().await else {
@@ -1450,16 +1506,18 @@ mod tests {
             let mut requests = HashMap::new();
             for request in [first, second] {
                 assert_publisher_fetch(&request);
-                assert_eq!(
-                    request.params.group_order().unwrap(),
-                    Some(GroupOrder::Descending)
-                );
+                let group_id = fetch_group(&request);
+                let expected_order = match group_id {
+                    0 => GroupOrder::Descending,
+                    1 => GroupOrder::Ascending,
+                    _ => panic!("unexpected concurrent FETCH range"),
+                };
+                assert_eq!(request.params.group_order().unwrap(), Some(expected_order));
                 assert_eq!(request.params.subscriber_priority().unwrap(), None);
                 assert!(request
                     .params
                     .get(parameter_type::AUTHORIZATION_TOKEN)
                     .is_none());
-                let group_id = fetch_group(&request);
                 assert!(requests.insert(group_id, request).is_none());
             }
             let first = requests.remove(&0).expect("missing group 0 FETCH");
@@ -1503,7 +1561,7 @@ mod tests {
 
             write(
                 &mut downstream.control_send,
-                &fetch_request_with_params(4, &namespace, 0, params),
+                &fetch_request_with_params(4, &namespace, 0, first_params),
             )
             .await;
             let Message::Fetch(third) = publisher.control_recv.decode::<Message>().await else {
@@ -1673,11 +1731,11 @@ mod tests {
             assert_eq!(error.error_code, RequestErrorCode::DoesNotExist as u64);
             assert_eq!(origin_lookups.load(Ordering::Relaxed), 1);
             assert_eq!(edge_lookups.load(Ordering::Relaxed), 8);
-            assert!(edge_scopes
+            assert!(edge_lookup_requests
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|scope| scope.as_deref() == Some("scope-a")));
+                .all(|(scope, _)| scope.as_deref() == Some("scope-a")));
         };
 
         tokio::time::timeout(Duration::from_secs(10), async {
