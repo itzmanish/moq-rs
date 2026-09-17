@@ -771,13 +771,13 @@ mod tests {
     use super::Producer;
 
     #[derive(Clone)]
-    struct TestCoordinator {
+    struct MockCoordinator {
         route: Option<(url::Url, std::net::SocketAddr, quic::Client)>,
         lookups: Arc<AtomicUsize>,
         scopes: Arc<Mutex<Vec<Option<String>>>>,
     }
 
-    impl TestCoordinator {
+    impl MockCoordinator {
         fn without_route() -> Self {
             Self {
                 route: None,
@@ -796,7 +796,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Coordinator for TestCoordinator {
+    impl Coordinator for MockCoordinator {
         async fn register_namespace(
             &self,
             _scope: Option<&str>,
@@ -1040,7 +1040,7 @@ mod tests {
     async fn local_namespace_fetch_passthrough_is_fresh_and_bidirectional() {
         let mut downstream = manual_peer().await;
         let mut upstream = manual_peer().await;
-        let test_coordinator = TestCoordinator::without_route();
+        let test_coordinator = MockCoordinator::without_route();
         let lookups = test_coordinator.lookups.clone();
         let coordinator: Arc<dyn Coordinator> = Arc::new(test_coordinator);
         let locals = Locals::new();
@@ -1167,11 +1167,11 @@ mod tests {
         let mut publisher = manual_peer().await;
         let (route_client, mut origin_server, origin_url, origin_addr) = test_endpoint();
         let edge_coordinator =
-            TestCoordinator::with_route(origin_url.clone(), origin_addr, route_client);
+            MockCoordinator::with_route(origin_url.clone(), origin_addr, route_client);
         let edge_lookups = edge_coordinator.lookups.clone();
         let edge_scopes = edge_coordinator.scopes.clone();
         let edge_coordinator: Arc<dyn Coordinator> = Arc::new(edge_coordinator);
-        let origin_coordinator = TestCoordinator::without_route();
+        let origin_coordinator = MockCoordinator::without_route();
         let origin_lookups = origin_coordinator.lookups.clone();
         let origin_coordinator: Arc<dyn Coordinator> = Arc::new(origin_coordinator);
         let edge_locals = Locals::new();
