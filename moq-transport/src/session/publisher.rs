@@ -19,7 +19,8 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    split_published_state, FetchRequested, FetchRequestedRecv, ObjectForwarderRecv, PendingRequest,
+    split_published_state, FetchRequested, FetchRequestedRecv, JoiningAssociation,
+    JoiningAssociationEntry, JoiningEligibility, ObjectForwarderRecv, PendingRequest,
     PendingRequests, PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo,
     PublishedRecv, RequestId, RequestIdAllocation, Session, SessionConfig, SessionError, SessionId,
     Subscribed, SubscribedNamespace, SubscribedNamespaceInfo, SubscribedNamespaceRecv,
@@ -67,13 +68,15 @@ impl NameRegistry {
 struct PublishedEntry {
     recv: PublishedRecv,
     forwarder: Option<ObjectForwarderRecv>,
+    joining: JoiningAssociationEntry,
 }
 
 impl PublishedEntry {
-    fn new(recv: PublishedRecv) -> Self {
+    fn new(recv: PublishedRecv, joining: JoiningAssociationEntry) -> Self {
         Self {
             recv,
             forwarder: None,
+            joining,
         }
     }
 
@@ -84,6 +87,11 @@ impl PublishedEntry {
         }
         Ok(())
     }
+}
+
+struct SubscribedEntry {
+    recv: ObjectForwarderRecv,
+    joining: JoiningAssociationEntry,
 }
 
 // TODO remove Clone.
@@ -102,7 +110,7 @@ pub struct Publisher {
     published_names: Arc<Mutex<NameRegistry>>,
 
     /// Active inbound SUBSCRIBE requests, keyed by request id.
-    subscribeds: Arc<Mutex<HashMap<u64, ObjectForwarderRecv>>>,
+    subscribeds: Arc<Mutex<HashMap<u64, SubscribedEntry>>>,
 
     /// Active inbound SUBSCRIBEs keyed by Full Track Name.
     subscribed_names: Arc<Mutex<NameRegistry>>,
@@ -113,7 +121,7 @@ pub struct Publisher {
     /// TRACK_STATUS requests for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_track_status_requested: Queue<TrackStatusRequested>,
 
-    /// Standalone FETCH requests waiting for application routing.
+    /// FETCH requests waiting for application routing.
     unknown_fetch_requested: Queue<FetchRequested>,
 
     /// Active inbound FETCH requests, keyed by request ID.
@@ -471,7 +479,14 @@ impl Publisher {
             Ok(mut publisheds) => {
                 publisheds.insert(
                     request_id,
-                    PublishedEntry::new(PublishedRecv::new(recv_state)),
+                    PublishedEntry::new(
+                        PublishedRecv::new(recv_state),
+                        JoiningAssociationEntry::pending_publisher(
+                            full_name.namespace.clone(),
+                            full_name.name.clone(),
+                            largest_location,
+                        ),
+                    ),
                 );
             }
             Err(_) => {
@@ -556,7 +571,7 @@ impl Publisher {
         self.unknown_track_status_requested.pop().await
     }
 
-    /// Returns the next standalone FETCH waiting for application routing.
+    /// Returns the next FETCH waiting for application routing.
     pub async fn fetch_requested(&mut self) -> Option<FetchRequested> {
         self.unknown_fetch_requested.pop().await
     }
@@ -631,55 +646,75 @@ impl Publisher {
         Ok(())
     }
 
-    /// Send REQUEST_ERROR NOT_SUPPORTED for an incoming request we do not implement.
-    ///
-    /// Draft-16 §4: limited endpoints SHOULD respond with NOT_SUPPORTED rather
-    /// than ignoring unsupported request types.
-    fn send_not_supported(&mut self, request_id: u64, request_kind: &str) {
-        tracing::debug!(
-            target: "moq_transport::control",
-            session_id = %self.session_id,
-            request_id,
-            "sending REQUEST_ERROR NOT_SUPPORTED for unimplemented request"
-        );
-        self.send_request_error(
-            request_kind,
-            message::RequestError {
-                id: request_id,
-                error_code: RequestErrorCode::NotSupported as u64,
-                retry_interval: 0,
-                reason: crate::coding::ReasonPhrase("not supported".to_string()),
-            },
-        );
-    }
-
     fn recv_fetch(&mut self, msg: message::Fetch) -> Result<(), SessionError> {
         let id = msg.id;
         validate_fetch_params(&msg.params)?;
-        if msg.fetch_type != message::FetchType::Standalone {
-            self.send_not_supported(msg.id, "joining fetch");
-            return Ok(());
-        }
-
-        let standalone = msg
-            .standalone_fetch
-            .as_ref()
-            .ok_or(SessionError::Internal)?;
-        if standalone.start_location != standalone.end_location
-            && standalone.start_location
-                > super::fetch_requested::inclusive_end(standalone.end_location)
-        {
-            self.send_request_error(
-                "fetch",
-                message::RequestError::new(
-                    msg.id,
-                    RequestErrorCode::InvalidRange,
-                    0,
-                    "fetch start is after end",
-                ),
-            );
-            return Ok(());
-        }
+        let joining = match msg.fetch_type {
+            message::FetchType::Standalone => {
+                let standalone = msg
+                    .standalone_fetch
+                    .as_ref()
+                    .ok_or(SessionError::Internal)?;
+                if standalone.start_location != standalone.end_location
+                    && standalone.start_location
+                        > super::fetch_requested::inclusive_end(standalone.end_location)
+                {
+                    self.send_request_error(
+                        "fetch",
+                        message::RequestError::new(
+                            msg.id,
+                            RequestErrorCode::InvalidRange,
+                            0,
+                            "fetch start is after end",
+                        ),
+                    );
+                    return Ok(());
+                }
+                None
+            }
+            message::FetchType::RelativeJoining | message::FetchType::AbsoluteJoining => {
+                let joining_request_id = msg
+                    .joining_fetch
+                    .as_ref()
+                    .ok_or(SessionError::Internal)?
+                    .joining_request_id;
+                let Some(association) = self.joining_association(joining_request_id)? else {
+                    self.send_request_error(
+                        "joining fetch",
+                        message::RequestError::new(
+                            msg.id,
+                            RequestErrorCode::InvalidJoiningRequestId,
+                            0,
+                            "invalid joining request ID",
+                        ),
+                    );
+                    return Ok(());
+                };
+                match association.eligibility()? {
+                    JoiningEligibility::Pending | JoiningEligibility::Established => {
+                        Some(association)
+                    }
+                    JoiningEligibility::InvalidRequestId => {
+                        self.send_request_error(
+                            "joining fetch",
+                            message::RequestError::new(
+                                msg.id,
+                                RequestErrorCode::InvalidJoiningRequestId,
+                                0,
+                                "invalid joining request ID",
+                            ),
+                        );
+                        return Ok(());
+                    }
+                    JoiningEligibility::WrongFilter => {
+                        return Err(SessionError::ProtocolViolation(
+                            "Joining FETCH requires a Largest Object subscription filter"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        };
 
         let (request, recv) = FetchRequested::new(
             Some(self.webtransport.clone()),
@@ -687,6 +722,7 @@ impl Publisher {
             self.outgoing.clone(),
             self.fetches.clone(),
             msg,
+            joining,
         );
         self.fetches
             .lock()
@@ -731,12 +767,16 @@ impl Publisher {
 
     /// Handle PUBLISH_OK from subscriber — acceptance of our PUBLISH (draft-16 §9.14).
     pub(super) fn recv_publish_ok(&mut self, msg: message::PublishOk) -> Result<(), SessionError> {
+        let filter = msg.params.subscription_filter()?;
         if let Some(published) = self
             .publisheds
             .lock()
             .map_err(|_| SessionError::Internal)?
             .get_mut(&msg.id)
         {
+            published
+                .joining
+                .establish_publisher(filter.map(|filter| filter.filter_type))?;
             published.recv.recv_ok(&msg)?;
         } else {
             tracing::debug!(
@@ -881,9 +921,9 @@ impl Publisher {
                 return Ok(());
             }
 
-            let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone())?;
+            let (send, recv, joining) = Subscribed::new(self.clone(), msg, self.mlog.clone())?;
             subscribed_names.insert(full_name, send.info.id);
-            subscribeds.insert(send.info.id, recv);
+            subscribeds.insert(send.info.id, SubscribedEntry { recv, joining });
 
             send
         };
@@ -981,8 +1021,11 @@ impl Publisher {
     }
 
     fn recv_unsubscribe(&mut self, msg: message::Unsubscribe) -> Result<(), SessionError> {
-        if let Some(mut subscribed) = self.remove_subscribe(msg.id)? {
-            subscribed.recv_unsubscribe()?;
+        if let Some(mut subscribed) = self.take_subscribe(msg.id)? {
+            let unsubscribe = subscribed.recv.recv_unsubscribe();
+            let terminate = subscribed.joining.terminate();
+            unsubscribe?;
+            terminate?;
             return Ok(());
         }
 
@@ -1065,6 +1108,15 @@ impl Publisher {
     }
 
     fn remove_subscribe(&mut self, id: u64) -> Result<Option<ObjectForwarderRecv>, SessionError> {
+        let subscribed = self.take_subscribe(id)?;
+        if let Some(subscribed) = &subscribed {
+            subscribed.joining.terminate()?;
+        }
+
+        Ok(subscribed.map(|subscribed| subscribed.recv))
+    }
+
+    fn take_subscribe(&mut self, id: u64) -> Result<Option<SubscribedEntry>, SessionError> {
         let mut subscribeds = self
             .subscribeds
             .lock()
@@ -1122,11 +1174,34 @@ impl Publisher {
         let mut publisheds = self.publisheds.lock().map_err(|_| SessionError::Internal)?;
 
         let published = publisheds.remove(&id);
-        if published.is_some() {
+        if let Some(published) = &published {
+            published.joining.terminate()?;
             published_names.remove_id(id);
         }
 
         Ok(published)
+    }
+
+    fn joining_association(
+        &self,
+        request_id: u64,
+    ) -> Result<Option<JoiningAssociation>, SessionError> {
+        if let Some(association) = self
+            .subscribeds
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get(&request_id)
+            .map(|entry| entry.joining.association())
+        {
+            return Ok(Some(association));
+        }
+
+        Ok(self
+            .publisheds
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get(&request_id)
+            .map(|entry| entry.joining.association()))
     }
 
     pub(super) async fn open_uni(&mut self) -> Result<web_transport::SendStream, SessionError> {
