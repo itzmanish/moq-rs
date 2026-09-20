@@ -1417,6 +1417,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn immediate_unsubscribe_before_subscribe_serve_is_benign() {
+        let mut peer = manual_peer().await;
+        let mut publisher = peer.server_publisher.clone();
+        let namespace = TrackNamespace::from_utf8_path("test/joining/unsubscribe-race");
+        let (writer, reader) = Track::new(namespace.clone(), "video").produce();
+        let mut datagrams = writer.datagrams().unwrap();
+        datagrams
+            .write(Datagram {
+                group_id: 2,
+                object_id: 3,
+                priority: 1,
+                payload: Vec::from(&b"live"[..]).into(),
+                extension_headers: Default::default(),
+            })
+            .unwrap();
+
+        let scenario = async {
+            write(
+                &mut peer.control_send,
+                &largest_object_subscribe(0, &namespace, "video".into()),
+            )
+            .await;
+            write(
+                &mut peer.control_send,
+                &Message::Unsubscribe(message::Unsubscribe { id: 0 }),
+            )
+            .await;
+            write(
+                &mut peer.control_send,
+                &joining_fetch_request(
+                    2,
+                    0,
+                    FetchType::RelativeJoining,
+                    0,
+                    KeyValuePairs::default(),
+                ),
+            )
+            .await;
+
+            let Message::RequestError(error) = peer.control_recv.decode::<Message>().await else {
+                panic!("expected removed subscription rejection");
+            };
+            assert_eq!(error.id, 2);
+            assert_eq!(
+                error.error_code,
+                RequestErrorCode::InvalidJoiningRequestId as u64
+            );
+
+            let subscribed = publisher.subscribed().await.unwrap();
+            assert!(matches!(
+                subscribed.serve(reader).await,
+                Err(SessionError::Serve(ServeError::Cancel))
+            ));
+            write(
+                &mut peer.control_send,
+                &joining_fetch_request(
+                    4,
+                    0,
+                    FetchType::RelativeJoining,
+                    0,
+                    KeyValuePairs::default(),
+                ),
+            )
+            .await;
+            let Message::RequestError(error) = peer.control_recv.decode::<Message>().await else {
+                panic!("canceled SUBSCRIBE produced an extra response");
+            };
+            assert_eq!(error.id, 4);
+            assert_eq!(
+                error.error_code,
+                RequestErrorCode::InvalidJoiningRequestId as u64
+            );
+
+            drop(datagrams);
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = scenario => {},
+                result = peer.server_session.run() => panic!("server session ended: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn publish_association_is_joinable_only_after_publish_ok() {
         let mut peer = manual_peer().await;
         let namespace = TrackNamespace::from_utf8_path("test/joining/publish");

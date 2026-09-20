@@ -232,11 +232,13 @@ impl JoiningAssociation {
         &self,
         saved_largest: Option<Location>,
     ) -> Result<(), SessionError> {
-        let mut state = self
+        let Some(mut state) = self
             .state
             .try_lock_mut()
             .map_err(|_| SessionError::Internal)?
-            .ok_or(SessionError::Internal)?;
+        else {
+            return Ok(());
+        };
         let JoiningPhase::PendingSubscriber { filter } = *state else {
             return Err(SessionError::ProtocolViolation(
                 "subscription is not pending subscriber establishment".to_string(),
@@ -255,7 +257,7 @@ impl JoiningAssociation {
             .try_lock_mut()
             .map_err(|_| SessionError::Internal)?
         else {
-            return Err(SessionError::Internal);
+            return Ok(());
         };
         let JoiningPhase::PendingPublisher { saved_largest } = *state else {
             return Err(SessionError::ProtocolViolation(
@@ -754,6 +756,35 @@ mod tests {
             waiter.await.unwrap().unwrap().unwrap().largest,
             Location::new(9, 3)
         );
+    }
+
+    #[test]
+    fn subscriber_establishment_is_benign_after_association_owner_drops() {
+        let (namespace, name) = full_name();
+        let entry = JoiningAssociationEntry::pending_subscriber(
+            namespace,
+            name,
+            Some(FilterType::LargestObject),
+        );
+        let association = entry.association();
+        drop(entry);
+
+        assert!(association
+            .establish_subscriber(Some(Location::new(1, 2)))
+            .is_ok());
+    }
+
+    #[test]
+    fn publisher_establishment_is_benign_after_association_owner_drops() {
+        let (namespace, name) = full_name();
+        let entry =
+            JoiningAssociationEntry::pending_publisher(namespace, name, Some(Location::new(1, 2)));
+        let association = entry.association();
+        drop(entry);
+
+        assert!(association
+            .establish_publisher(Some(FilterType::LargestObject))
+            .is_ok());
     }
 
     fn subscribe_info_with(params: KeyValuePairs) -> SubscribeInfo {
