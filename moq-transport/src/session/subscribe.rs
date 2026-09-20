@@ -225,6 +225,15 @@ impl JoiningAssociationEntry {
     pub fn terminate(&self) -> Result<(), SessionError> {
         self.association.terminate()
     }
+
+    #[cfg(test)]
+    pub fn poison_state(&self) {
+        let state = self.association.state.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = state.try_lock_mut().unwrap();
+            panic!("poison joining association state");
+        }));
+    }
 }
 
 impl JoiningAssociation {

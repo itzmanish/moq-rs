@@ -1167,19 +1167,7 @@ impl Publisher {
 
     fn remove_published(&mut self, id: u64) -> Result<Option<PublishedEntry>, SessionError> {
         let _ = self.pending_requests.remove(id);
-        let mut published_names = self
-            .published_names
-            .lock()
-            .map_err(|_| SessionError::Internal)?;
-        let mut publisheds = self.publisheds.lock().map_err(|_| SessionError::Internal)?;
-
-        let published = publisheds.remove(&id);
-        if let Some(published) = &published {
-            published.joining.terminate()?;
-            published_names.remove_id(id);
-        }
-
-        Ok(published)
+        remove_published_from_maps(&self.published_names, &self.publisheds, id)
     }
 
     fn joining_association(
@@ -1213,6 +1201,26 @@ impl Publisher {
     }
 }
 
+fn remove_published_from_maps(
+    published_names: &Arc<Mutex<NameRegistry>>,
+    publisheds: &Arc<Mutex<HashMap<u64, PublishedEntry>>>,
+    id: u64,
+) -> Result<Option<PublishedEntry>, SessionError> {
+    let published = {
+        let mut published_names = published_names.lock().map_err(|_| SessionError::Internal)?;
+        let mut publisheds = publisheds.lock().map_err(|_| SessionError::Internal)?;
+        let published = publisheds.remove(&id);
+        published_names.remove_id(id);
+        published
+    };
+
+    if let Some(published) = &published {
+        published.joining.terminate()?;
+    }
+
+    Ok(published)
+}
+
 fn validate_fetch_params(params: &KeyValuePairs) -> Result<(), crate::coding::DecodeError> {
     crate::message::validate_message_parameter_types(params)?;
     params.subscriber_priority()?;
@@ -1230,7 +1238,9 @@ mod tests {
         serve::FullTrackName,
     };
 
-    use super::{validate_fetch_params, NameRegistry, Publisher};
+    use super::{
+        remove_published_from_maps, validate_fetch_params, NameRegistry, PublishedEntry, Publisher,
+    };
 
     fn full_track_name(namespace: &str, name: &str) -> FullTrackName {
         FullTrackName {
@@ -1299,6 +1309,48 @@ mod tests {
         assert_eq!(names.by_name.get(&track), Some(&6));
         assert_eq!(names.by_id.get(&6), Some(&track));
         assert!(!names.by_id.contains_key(&8));
+    }
+
+    #[test]
+    fn published_name_is_removed_when_joining_termination_fails() {
+        let id = 7;
+        let name = full_track_name("test", "video");
+        let (_, recv_state) = super::split_published_state(true);
+        let joining = super::JoiningAssociationEntry::pending_publisher(
+            name.namespace.clone(),
+            name.name.clone(),
+            None,
+        );
+        joining.poison_state();
+        let published = PublishedEntry::new(super::PublishedRecv::new(recv_state), joining);
+        let names = Arc::new(Mutex::new(NameRegistry::default()));
+        names.lock().unwrap().insert(name.clone(), id);
+        let publisheds = Arc::new(Mutex::new(HashMap::from([(id, published)])));
+
+        assert!(matches!(
+            remove_published_from_maps(&names, &publisheds, id),
+            Err(super::SessionError::Internal)
+        ));
+        assert!(publisheds.lock().unwrap().is_empty());
+        let names = names.lock().unwrap();
+        assert!(!names.contains_name(&name));
+        assert!(!names.by_id.contains_key(&id));
+    }
+
+    #[test]
+    fn published_name_is_removed_when_entry_is_already_absent() {
+        let id = 7;
+        let name = full_track_name("test", "video");
+        let names = Arc::new(Mutex::new(NameRegistry::default()));
+        names.lock().unwrap().insert(name.clone(), id);
+        let publisheds = Arc::new(Mutex::new(HashMap::new()));
+
+        assert!(remove_published_from_maps(&names, &publisheds, id)
+            .unwrap()
+            .is_none());
+        let names = names.lock().unwrap();
+        assert!(!names.contains_name(&name));
+        assert!(!names.by_id.contains_key(&id));
     }
 
     #[test]
